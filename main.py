@@ -40,6 +40,8 @@ else:
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
+print("Buckets:", supabase.storage.list_buckets())
+
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
     """Upload een bestand naar Supabase Storage en geef publieke URL terug."""
     if not supabase:
