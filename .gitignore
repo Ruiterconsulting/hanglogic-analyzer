@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+*.egg-info/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+
+# IDE settings
+.vscode/
+.idea/
+
+# Build
+dist/
+build/
