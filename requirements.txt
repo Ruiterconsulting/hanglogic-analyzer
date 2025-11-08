@@ -1,6 +1,5 @@
 fastapi==0.115.0
-uvicorn[standard]==0.30.6
+uvicorn==0.30.6
 supabase==2.6.0
-python-multipart==0.0.9
-pydantic==2.9.2
-aiofiles==23.2.1
+cadquery==2.4.0
+numpy==1.26.4
