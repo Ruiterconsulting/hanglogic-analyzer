@@ -82,6 +82,23 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             pass
 
+    # --- Save result to Supabase ---
+    try:
+        supabase.table("analyzed_parts").insert({
+            "filename": filename,
+            "dimensions": {
+                "x": bbox["X"],
+                "y": bbox["Y"],
+                "z": bbox["Z"]
+            },
+            "volume_mm3": volume,
+            "units": "mm",
+            "holes_detected": 0  # (later wordt dit automatisch bepaald)
+        }).execute()
+    except Exception as e:
+        print("⚠️ Error saving to Supabase:", e)
+
+        
         return JSONResponse(
             content={
                 "status": "success",
