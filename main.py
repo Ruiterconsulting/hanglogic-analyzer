@@ -6,11 +6,13 @@ from OCC.Core.BRepBndLib import brepbndlib_Add
 from OCC.Core.Bnd import Bnd_Box
 import tempfile, os, uuid
 
+# --- Supabase setup ---
 SUPABASE_URL = "https://sywnjytfygvotskufvzs.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5d25qeXRmeWd2b3Rza3VmdnpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI1ODAzMTAsImV4cCI6MjA3ODE1NjMxMH0.rwdyRnjOAG5pUrPufoZL13_O0HAQhuP8E2O_Al2kqMY"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- FastAPI app ---
 app = FastAPI(title="HangLogic STEP Analyzer")
 
 app.add_middleware(
@@ -21,23 +23,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def root():
+    """Health check endpoint"""
     return {"message": "STEP analyzer is live ✅"}
+
 
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
-    """Lees STEP, bereken bounding box"""
+    """Upload .STEP file → analyze geometry → store result in Supabase"""
     try:
+        # Tijdelijk bestand aanmaken
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        # STEP-bestand inlezen
         step_reader = STEPControl_Reader()
-        step_reader.ReadFile(tmp_path)
+        status = step_reader.ReadFile(tmp_path)
+        if status != 1:
+            return {"status": "error", "details": "Kon STEP-bestand niet lezen"}
+
         step_reader.TransferRoots()
         shape = step_reader.OneShape()
 
+        # Bounding box berekenen
         bbox = Bnd_Box()
         brepbndlib_Add(shape, bbox)
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
@@ -52,8 +63,10 @@ async def analyze_step(file: UploadFile = File(...)):
             }
         }
 
+        # Wegschrijven naar Supabase
         supabase.table("analyzed_parts").insert(result).execute()
 
+        # Opschonen
         os.remove(tmp_path)
         return {"status": "success", "data": result}
 
