@@ -1,19 +1,16 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os
-import tempfile
-import uuid
+import cadquery as cq
+import tempfile, os, uuid
 
-# ✅ Supabase keys (je mag hier je eigen projectgegevens invullen)
 SUPABASE_URL = "https://sywnjytfygvotskufvzs.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5d25qeXRmeWd2b3Rza3VmdnpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI1ODAzMTAsImV4cCI6MjA3ODE1NjMxMH0.rwdyRnjOAG5pUrPufoZL13_O0HAQhuP8E2O_Al2kqMY"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="HangLogic Analyzer API")
+app = FastAPI(title="HangLogic Analyzer API (STEP Parser)")
 
-# ✅ CORS – zodat Lovable frontend contact mag maken
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,43 +21,45 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic Analyzer API running!"}
+    return {"message": "STEP Analyzer API active ✅"}
 
 @app.post("/analyze")
-async def analyze_file(file: UploadFile = File(...)):
-    """
-    Dummy analyzer – leest bestand, berekent grootte en slaat het resultaat op in Supabase
-    """
+async def analyze_step(file: UploadFile = File(...)):
+    """Lees STEP-file, bereken bounding box, volume, holes"""
     try:
-        # Sla tijdelijk bestand op
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        # Tijdelijk bestand
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Simpele 'analyse'
-        file_size_kb = round(len(content) / 1024, 2)
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        part_id = str(uuid.uuid4())
+        # Analyse via CadQuery
+        model = cq.importers.importStep(tmp_path)
+        bounding_box = model.val().BoundingBox()
+        holes = [f for f in model.faces() if "Circle" in str(f.geomType())]
+        volume = model.val().Volume()
+
+        dims = {
+            "x_mm": round(bounding_box.xlen, 2),
+            "y_mm": round(bounding_box.ylen, 2),
+            "z_mm": round(bounding_box.zlen, 2),
+        }
 
         result = {
-            "id": part_id,
+            "id": str(uuid.uuid4()),
             "file_name": file.filename,
-            "file_type": file_ext,
-            "size_kb": file_size_kb,
+            "dimensions_mm": dims,
+            "holes_detected": len(holes),
+            "volume_mm3": round(volume, 2),
         }
 
-        # Sla resultaat op in Supabase
-        data, count = supabase.table("analyzed_parts").insert(result).execute()
+        # Opslaan in Supabase
+        supabase.table("analyzed_parts").insert(result).execute()
 
-        # Opruimen
+        # Verwijder tijdelijk bestand
         os.remove(tmp_path)
 
-        return {
-            "status": "success",
-            "analyzed": result,
-            "supabase_response": data,
-        }
+        return {"status": "success", "analysis": result}
 
     except Exception as e:
         return {"status": "error", "details": str(e)}
