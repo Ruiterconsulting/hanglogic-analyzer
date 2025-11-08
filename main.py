@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,26 +8,24 @@ import tempfile
 import os
 import traceback
 
-# -------------------------------
-# Supabase Setup
-# -------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# -------------------------------
-# FastAPI Setup
-# -------------------------------
+# === Initialize FastAPI ===
 app = FastAPI(title="HangLogic Analyzer API", version="1.0.0")
 
+# === Allow CORS (for Lovable frontend) ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # eventueel beperken tot jouw domeinen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# === Supabase setup ===
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# === Routes ===
 @app.get("/")
 def root():
     return {"message": "STEP analyzer live ✅ (CadQuery mode)"}
@@ -35,9 +34,7 @@ def root():
 def health():
     return {"status": "ok"}
 
-# -------------------------------
-# Helpers
-# -------------------------------
+
 def _ensure_step_extension(filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
     if ext not in [".step", ".stp"]:
@@ -46,13 +43,15 @@ def _ensure_step_extension(filename: str):
             detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
         )
 
-# -------------------------------
-# Main endpoint
-# -------------------------------
+# === Main Analyze Route ===
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
+    """
+    Ontvangt een .STEP/.STP bestand, laadt het met CadQuery,
+    berekent bounding box en volume, en slaat alles op in Supabase.
+    """
     try:
-        # 1️⃣ Validatie
+        # 1️⃣ Validatie bestandstype
         _ensure_step_extension(file.filename)
 
         # 2️⃣ Tijdelijk opslaan
@@ -60,15 +59,11 @@ async def analyze_step(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # 3️⃣ STEP inladen
+        # 3️⃣ STEP importeren
         model = cq.importers.importStep(tmp_path)
+        shape = model.val()  # shape extraheren
 
-        try:
-            shape = model.val()
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid STEP geometry")
-
-        # 4️⃣ Bounding box
+        # 4️⃣ Bounding box berekenen (in mm)
         bbox = shape.BoundingBox()
         dims = {
             "X": round(float(bbox.xlen), 3),
@@ -76,13 +71,19 @@ async def analyze_step(file: UploadFile = File(...)):
             "Z": round(float(bbox.zlen), 3),
         }
 
-        # 5️⃣ Volume (optioneel)
+        # 5️⃣ Volume bepalen
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
             volume_mm3 = None
 
-        # 6️⃣ Opslaan in Supabase
+        # 6️⃣ Verwijder tijdelijk bestand
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+        # 7️⃣ Opslaan in Supabase
         try:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -91,14 +92,17 @@ async def analyze_step(file: UploadFile = File(...)):
                     "y": dims["Y"],
                     "z": dims["Z"]
                 },
-                "volume_mm3": volume_mm3,
+                "bounding_box_x": dims["X"],
+                "bounding_box_y": dims["Y"],
+                "bounding_box_z": dims["Z"],
+                "volume_mm3": round(volume_mm3, 3) if volume_mm3 else None,
                 "units": "mm",
                 "holes_detected": 0
             }).execute()
         except Exception as e:
             print("⚠️ Error saving to Supabase:", e)
 
-        # 7️⃣ Teruggeven aan frontend / Lovable
+        # 8️⃣ Response naar frontend
         return JSONResponse(
             content={
                 "status": "success",
@@ -111,6 +115,7 @@ async def analyze_step(file: UploadFile = File(...)):
 
     except HTTPException as he:
         return JSONResponse(status_code=he.status_code, content={"error": he.detail})
+
     except Exception as e:
         tb = traceback.format_exc(limit=3)
         return JSONResponse(
