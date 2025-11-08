@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,7 +10,7 @@ from supabase import create_client, Client
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.2.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +31,12 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Connected to Supabase.")
+        # Log beschikbare buckets
+        try:
+            buckets = supabase.storage.list_buckets()
+            print("📦 Buckets found:", [b.name for b in buckets])
+        except Exception as e:
+            print("⚠️ Could not list buckets:", e)
     except Exception as e:
         print("⚠️ Could not initialize Supabase client:", e)
 else:
@@ -40,8 +45,6 @@ else:
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
-print("Buckets:", supabase.storage.list_buckets())
-
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
     """Upload een bestand naar Supabase Storage en geef publieke URL terug."""
     if not supabase:
@@ -50,13 +53,20 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     bucket = "cad-models"
     remote_path = f"analyzed/{remote_name}"
 
-    with open(local_path, "rb") as f:
-        # upload zonder bools
-        supabase.storage.from_(bucket).upload(remote_path, f)
+    try:
+        with open(local_path, "rb") as f:
+            res = supabase.storage.from_(bucket).upload(remote_path, f)
+        print("✅ Upload result:", res)
+    except Exception as e:
+        print("⚠️ Upload failed:", e)
+        raise RuntimeError(f"Upload to Supabase failed: {e}")
 
-    # publieke URL ophalen
-    public_url = supabase.storage.from_(bucket).get_public_url(remote_path)
-    return public_url
+    try:
+        public_url = supabase.storage.from_(bucket).get_public_url(remote_path)
+        print("🌍 Public URL:", public_url)
+        return public_url
+    except Exception as e:
+        raise RuntimeError(f"Could not retrieve public URL: {e}")
 
 # -------------------------------
 # 🔍 Basis endpoints
@@ -121,18 +131,14 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # -------------------------------
-        # 🧱 STL-export
-        # -------------------------------
+        # 6️⃣ STL-export
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # Upload naar Supabase
+        # 7️⃣ Upload naar Supabase
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # -------------------------------
-        # 💾 Opslaan in Supabase database
-        # -------------------------------
+        # 8️⃣ Opslaan in Supabase database
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -146,9 +152,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "model_url": stl_public_url,
             }).execute()
 
-        # -------------------------------
-        # ✅ Terug naar frontend
-        # -------------------------------
+        # 9️⃣ Terug naar frontend
         return JSONResponse(
             content={
                 "status": "success",
@@ -166,7 +170,6 @@ async def analyze_step(file: UploadFile = File(...)):
         tb = traceback.format_exc(limit=3)
         return JSONResponse(status_code=500, content={"error": f"Analysis failed: {str(e)}", "trace": tb})
     finally:
-        # Alle tijdelijke bestanden opruimen
         for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
             try:
                 if path and os.path.exists(path):
