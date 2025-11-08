@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-requests==2.32.3
 supabase==2.6.0
-pythonocc-core==7.7.2
-numpy==1.26.4
+python-multipart==0.0.9
+pydantic==2.9.2
+aiofiles==23.2.1
