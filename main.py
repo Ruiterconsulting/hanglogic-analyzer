@@ -49,11 +49,10 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
 
     with open(local_path, "rb") as f:
-        res = supabase.storage.from_(bucket).upload(remote_path, f, {"upsert": True})
+        # upload zonder bools
+        supabase.storage.from_(bucket).upload(remote_path, f)
 
-    if res.get("error"):
-        raise RuntimeError(f"Upload failed: {res['error']}")
-
+    # publieke URL ophalen
     public_url = supabase.storage.from_(bucket).get_public_url(remote_path)
     return public_url
 
