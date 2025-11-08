@@ -1,7 +1,9 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import cadquery as cq
+from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.BRepBndLib import brepbndlib_Add
+from OCC.Core.Bnd import Bnd_Box
 import tempfile, os, uuid
 
 SUPABASE_URL = "https://sywnjytfygvotskufvzs.supabase.co"
@@ -9,7 +11,7 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="HangLogic Analyzer API (STEP Parser)")
+app = FastAPI(title="HangLogic STEP Analyzer")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,45 +23,39 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"message": "STEP Analyzer API active ✅"}
+    return {"message": "STEP analyzer is live ✅"}
 
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
-    """Lees STEP-file, bereken bounding box, volume, holes"""
+    """Lees STEP, bereken bounding box"""
     try:
-        # Tijdelijk bestand
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
-            content = await file.read()
-            tmp.write(content)
+            tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Analyse via CadQuery
-        model = cq.importers.importStep(tmp_path)
-        bounding_box = model.val().BoundingBox()
-        holes = [f for f in model.faces() if "Circle" in str(f.geomType())]
-        volume = model.val().Volume()
+        step_reader = STEPControl_Reader()
+        step_reader.ReadFile(tmp_path)
+        step_reader.TransferRoots()
+        shape = step_reader.OneShape()
 
-        dims = {
-            "x_mm": round(bounding_box.xlen, 2),
-            "y_mm": round(bounding_box.ylen, 2),
-            "z_mm": round(bounding_box.zlen, 2),
-        }
+        bbox = Bnd_Box()
+        brepbndlib_Add(shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
 
         result = {
             "id": str(uuid.uuid4()),
             "file_name": file.filename,
-            "dimensions_mm": dims,
-            "holes_detected": len(holes),
-            "volume_mm3": round(volume, 2),
+            "bounding_box_mm": {
+                "x": round(xmax - xmin, 2),
+                "y": round(ymax - ymin, 2),
+                "z": round(zmax - zmin, 2),
+            }
         }
 
-        # Opslaan in Supabase
         supabase.table("analyzed_parts").insert(result).execute()
 
-        # Verwijder tijdelijk bestand
         os.remove(tmp_path)
-
-        return {"status": "success", "analysis": result}
+        return {"status": "success", "data": result}
 
     except Exception as e:
         return {"status": "error", "details": str(e)}
