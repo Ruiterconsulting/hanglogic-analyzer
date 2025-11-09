@@ -47,32 +47,52 @@ else:
 # -------------------------------
 def detect_holes(shape):
     """
-    Detecteer ronde gaten: we inspecteren faces en pakken cylinders (typisch voor geboorde gaten).
-    Retourneert: lijst met dicts {x,y,z,diameter} in mm.
+    Detecteert ronde gaten in de shape:
+    - Cylindrical faces (zoals boorgaten)
+    - Circular edges op platte vlakken (voor doorlopende gaten)
+    Retourneert lijst van {x, y, z, diameter}.
     """
     holes = []
     try:
+        # --- 1️⃣ Cylindrische oppervlakken (zoals eerst)
         for face in shape.Faces():
-            # CadQuery: face.geomType() geeft o.a. "PLANE", "CYLINDER", "SPHERE", ...
             gtype = face.geomType() if hasattr(face, "geomType") else None
             if gtype == "CYLINDER":
                 try:
                     surf = face.Surface()
-                    # radius, locatie (x,y,z)
                     radius = float(surf.Radius())
                     loc = surf.Location()
-                    # loc.toTuple() => ((x,y,z), (i,j,k), ...) – we pakken translatie
-                    pos = loc.toTuple()[0][:3] if hasattr(loc, "toTuple") else (0.0, 0.0, 0.0)
+                    pos = loc.toTuple()[0][:3]
                     holes.append({
-                        "x": round(float(pos[0]), 3),
-                        "y": round(float(pos[1]), 3),
-                        "z": round(float(pos[2]), 3),
+                        "x": round(pos[0], 3),
+                        "y": round(pos[1], 3),
+                        "z": round(pos[2], 3),
                         "diameter": round(radius * 2.0, 3)
                     })
-                except Exception as inner_e:
-                    # Als Surface() niet lukt, rustig overslaan
-                    print("ℹ️ Skipped face in hole detection:", inner_e)
+                except Exception:
                     continue
+
+        # --- 2️⃣ Circular edges op platte vlakken (typisch voor doorlopende gaten)
+        for edge in shape.Edges():
+            curve = edge._geomAdaptor().GetType()
+            if "Circle" in str(curve):  # cirkelvormige rand
+                circ = edge._geomAdaptor().Circle()
+                radius = float(circ.Radius())
+                center = circ.Location().toTuple()[0][:3]
+                holes.append({
+                    "x": round(center[0], 3),
+                    "y": round(center[1], 3),
+                    "z": round(center[2], 3),
+                    "diameter": round(radius * 2.0, 3)
+                })
+
+        # --- 3️⃣ Dubbele entries weghalen (zelfde locatie ±0.1mm)
+        unique = []
+        for h in holes:
+            if not any(abs(h["x"] - u["x"]) < 0.1 and abs(h["y"] - u["y"]) < 0.1 and abs(h["z"] - u["z"]) < 0.1 for u in unique):
+                unique.append(h)
+        holes = unique
+
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
     return holes
