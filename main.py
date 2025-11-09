@@ -10,7 +10,7 @@ from supabase import create_client, Client
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.4.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +32,6 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Connected to Supabase.")
-        # Log beschikbare buckets
         try:
             buckets = supabase.storage.list_buckets()
             print("📦 Buckets found:", [b.name for b in buckets])
@@ -43,6 +42,40 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
+# -------------------------------
+# 🕳️ Gatdetectie helper
+# -------------------------------
+def detect_holes(shape):
+    """
+    Detecteer ronde gaten: we inspecteren faces en pakken cylinders (typisch voor geboorde gaten).
+    Retourneert: lijst met dicts {x,y,z,diameter} in mm.
+    """
+    holes = []
+    try:
+        for face in shape.Faces():
+            # CadQuery: face.geomType() geeft o.a. "PLANE", "CYLINDER", "SPHERE", ...
+            gtype = face.geomType() if hasattr(face, "geomType") else None
+            if gtype == "CYLINDER":
+                try:
+                    surf = face.Surface()
+                    # radius, locatie (x,y,z)
+                    radius = float(surf.Radius())
+                    loc = surf.Location()
+                    # loc.toTuple() => ((x,y,z), (i,j,k), ...) – we pakken translatie
+                    pos = loc.toTuple()[0][:3] if hasattr(loc, "toTuple") else (0.0, 0.0, 0.0)
+                    holes.append({
+                        "x": round(float(pos[0]), 3),
+                        "y": round(float(pos[1]), 3),
+                        "z": round(float(pos[2]), 3),
+                        "diameter": round(radius * 2.0, 3)
+                    })
+                except Exception as inner_e:
+                    # Als Surface() niet lukt, rustig overslaan
+                    print("ℹ️ Skipped face in hole detection:", inner_e)
+                    continue
+    except Exception as e:
+        print("⚠️ Hole detection failed:", e)
+    return holes
 
 # -------------------------------
 # 📦 Upload helper (definitieve versie)
@@ -65,7 +98,9 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
         try:
             files = storage.list(path="analyzed")
             for f in files:
-                if f["name"] == remote_name:
+                # f kan dict of object zijn afhankelijk van libversie
+                name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+                if name == remote_name:
                     print(f"⚠️ Bestand {remote_name} bestaat al — verwijderen...")
                     storage.remove([f"analyzed/{remote_name}"])
                     break
@@ -85,18 +120,16 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
 
-
 # -------------------------------
 # 🔍 Basis endpoints
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (CadQuery + STL export + Supabase upload)"}
+    return {"message": "STEP analyzer live ✅ (CadQuery + STL export + holes + Supabase)"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 # -------------------------------
 # 🧰 Hulpfunctie
@@ -109,7 +142,6 @@ def _ensure_step_extension(filename: str):
             detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
         )
 
-
 # -------------------------------
 # 🧮 Analyzer endpoint
 # -------------------------------
@@ -117,7 +149,7 @@ def _ensure_step_extension(filename: str):
 async def analyze_step(file: UploadFile = File(...)):
     """
     Ontvangt een .STEP/.STP bestand, berekent bounding box en volume,
-    exporteert STL, uploadt naar Supabase, en slaat metadata op.
+    detecteert gaten, exporteert STL, uploadt naar Supabase, en slaat metadata op.
     """
     tmp_path = None
     try:
@@ -140,6 +172,7 @@ async def analyze_step(file: UploadFile = File(...)):
             "y": round(float(bbox.ylen), 3),
             "z": round(float(bbox.zlen), 3),
         }
+        # Sorteer op grootte: X=langste, Y=middelste, Z=kleinste
         sorted_dims = sorted(raw_dims.values(), reverse=True)
         dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
@@ -149,19 +182,24 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # 6️⃣ STL-export
+        # 6️⃣ Gaten detectie
+        holes = detect_holes(shape)
+        holes_detected = len(holes)
+
+        # 7️⃣ STL-export
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # 7️⃣ Upload naar Supabase
+        # 8️⃣ Upload naar Supabase (Storage)
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # 8️⃣ Opslaan in database
+        # 9️⃣ Opslaan in database (Table: analyzed_parts)
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
                 "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
-                "holes_detected": 0,
+                "holes_detected": holes_detected,
+                "holes_data": holes,              # JSONB kolom
                 "created_at": "now()",
                 "units": "mm",
                 "bounding_box_x": dims["X"],
@@ -170,7 +208,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "model_url": stl_public_url,
             }).execute()
 
-        # 9️⃣ Antwoord naar frontend
+        # 🔟 Antwoord naar frontend
         return JSONResponse(
             content={
                 "status": "success",
@@ -178,20 +216,20 @@ async def analyze_step(file: UploadFile = File(...)):
                 "boundingBoxMM": dims,
                 "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
                 "filename": file.filename,
+                "holesDetected": holes_detected,
+                "holes": holes,
                 "modelURL": stl_public_url,
             }
         )
 
     except HTTPException as he:
         return JSONResponse(status_code=he.status_code, content={"error": he.detail})
-
     except Exception as e:
         tb = traceback.format_exc(limit=3)
         return JSONResponse(
             status_code=500,
             content={"error": f"Analysis failed: {str(e)}", "trace": tb},
         )
-
     finally:
         # Verwijder tijdelijke bestanden
         for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
