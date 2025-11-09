@@ -55,7 +55,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
 
     try:
         with open(local_path, "rb") as f:
-            res = supabase.storage.from_(bucket).upload(remote_path, f)
+            res = supabase.storage.from_(bucket).upload(remote_path, f, {"upsert": True})
         print("✅ Upload result:", res)
     except Exception as e:
         print("⚠️ Upload failed:", e)
