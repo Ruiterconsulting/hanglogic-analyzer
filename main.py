@@ -10,11 +10,11 @@ from supabase import create_client, Client
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.3.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # eventueel beperken tot jouw Lovable domeinen
+    allow_origins=["*"],  # later kun je dit beperken tot jouw Lovable domeinen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,6 +25,7 @@ app.add_middleware(
 # -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 supabase: Client | None = None
 
 if SUPABASE_URL and SUPABASE_KEY:
@@ -42,42 +43,60 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
+
 # -------------------------------
-# 📦 Upload helper
+# 📦 Upload helper (definitieve versie)
 # -------------------------------
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
-    """Upload een bestand naar Supabase Storage en geef publieke URL terug."""
+    """
+    Upload bestand naar Supabase Storage.
+    Bestaat het al → dan verwijderen we het eerst.
+    Retourneert de publieke URL.
+    """
     if not supabase:
         raise RuntimeError("Supabase client not initialized.")
 
     bucket = "cad-models"
     remote_path = f"analyzed/{remote_name}"
+    storage = supabase.storage.from_(bucket)
 
     try:
+        # 🔹 Bestaat het bestand al? -> verwijder het
+        try:
+            files = storage.list(path="analyzed")
+            for f in files:
+                if f["name"] == remote_name:
+                    print(f"⚠️ Bestand {remote_name} bestaat al — verwijderen...")
+                    storage.remove([f"analyzed/{remote_name}"])
+                    break
+        except Exception as e:
+            print("ℹ️ Geen bestaande bestanden gevonden of kon niet lezen:", e)
+
+        # 🔹 Upload nieuw bestand
         with open(local_path, "rb") as f:
-            res = supabase.storage.from_(bucket).upload(remote_path, f, {"upsert": True})
-        print("✅ Upload result:", res)
-    except Exception as e:
-        print("⚠️ Upload failed:", e)
-        raise RuntimeError(f"Upload to Supabase failed: {e}")
+            res = storage.upload(remote_path, f)
+        print("✅ Upload gelukt:", res)
 
-    try:
-        public_url = supabase.storage.from_(bucket).get_public_url(remote_path)
+        # 🔹 Publieke URL ophalen
+        public_url = storage.get_public_url(remote_path)
         print("🌍 Public URL:", public_url)
         return public_url
+
     except Exception as e:
-        raise RuntimeError(f"Could not retrieve public URL: {e}")
+        raise RuntimeError(f"Upload to Supabase failed: {e}")
+
 
 # -------------------------------
 # 🔍 Basis endpoints
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (CadQuery + STL export)"}
+    return {"message": "STEP analyzer live ✅ (CadQuery + STL export + Supabase upload)"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # -------------------------------
 # 🧰 Hulpfunctie
@@ -90,14 +109,15 @@ def _ensure_step_extension(filename: str):
             detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
         )
 
+
 # -------------------------------
 # 🧮 Analyzer endpoint
 # -------------------------------
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     """
-    Ontvangt een .STEP/.STP bestand, laadt het met CadQuery,
-    bepaalt bounding box, volume, exporteert STL en slaat op in Supabase.
+    Ontvangt een .STEP/.STP bestand, berekent bounding box en volume,
+    exporteert STL, uploadt naar Supabase, en slaat metadata op.
     """
     tmp_path = None
     try:
@@ -109,23 +129,21 @@ async def analyze_step(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # 3️⃣ Importeren in CadQuery
+        # 3️⃣ Inladen in CadQuery
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
 
-        # 4️⃣ Bounding box bepalen
+        # 4️⃣ Bounding box
         bbox = shape.BoundingBox()
         raw_dims = {
             "x": round(float(bbox.xlen), 3),
             "y": round(float(bbox.ylen), 3),
             "z": round(float(bbox.zlen), 3),
         }
-
-        # Sorteer op grootte: X=langste, Y=middelste, Z=kleinste
         sorted_dims = sorted(raw_dims.values(), reverse=True)
         dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
-        # 5️⃣ Volume berekenen
+        # 5️⃣ Volume
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
@@ -138,7 +156,7 @@ async def analyze_step(file: UploadFile = File(...)):
         # 7️⃣ Upload naar Supabase
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # 8️⃣ Opslaan in Supabase database
+        # 8️⃣ Opslaan in database
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -152,7 +170,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "model_url": stl_public_url,
             }).execute()
 
-        # 9️⃣ Terug naar frontend
+        # 9️⃣ Antwoord naar frontend
         return JSONResponse(
             content={
                 "status": "success",
@@ -166,10 +184,16 @@ async def analyze_step(file: UploadFile = File(...)):
 
     except HTTPException as he:
         return JSONResponse(status_code=he.status_code, content={"error": he.detail})
+
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {str(e)}", "trace": tb})
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Analysis failed: {str(e)}", "trace": tb},
+        )
+
     finally:
+        # Verwijder tijdelijke bestanden
         for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
             try:
                 if path and os.path.exists(path):
