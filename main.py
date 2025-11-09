@@ -47,49 +47,67 @@ else:
 # -------------------------------
 def detect_holes(shape):
     """
-    Detecteert ronde gaten in de shape:
-    - Cylindrical faces (zoals boorgaten)
-    - Circular edges op platte vlakken (voor doorlopende gaten)
-    Retourneert lijst van {x, y, z, diameter}.
+    Detecteert ronde gaten in het model.
+    Herkent ook doorlopende gaten (boven- en onderzijde).
+    Retourneert lijst met {x, y, z, diameter}.
     """
     holes = []
     try:
-        # --- 1️⃣ Cylindrische oppervlakken (zoals eerst)
-        for face in shape.Faces():
-            gtype = face.geomType() if hasattr(face, "geomType") else None
-            if gtype == "CYLINDER":
-                try:
-                    surf = face.Surface()
-                    radius = float(surf.Radius())
-                    loc = surf.Location()
-                    pos = loc.toTuple()[0][:3]
-                    holes.append({
-                        "x": round(pos[0], 3),
-                        "y": round(pos[1], 3),
-                        "z": round(pos[2], 3),
-                        "diameter": round(radius * 2.0, 3)
-                    })
-                except Exception:
-                    continue
-
-        # --- 2️⃣ Circular edges op platte vlakken (typisch voor doorlopende gaten)
+        # Verzamel cirkelranden
+        circular_edges = []
         for edge in shape.Edges():
-            curve = edge._geomAdaptor().GetType()
-            if "Circle" in str(curve):  # cirkelvormige rand
-                circ = edge._geomAdaptor().Circle()
-                radius = float(circ.Radius())
-                center = circ.Location().toTuple()[0][:3]
-                holes.append({
-                    "x": round(center[0], 3),
-                    "y": round(center[1], 3),
-                    "z": round(center[2], 3),
-                    "diameter": round(radius * 2.0, 3)
-                })
+            try:
+                t = edge.geomType()
+                if t == "CIRCLE":
+                    circ = edge._geomAdaptor().Circle()
+                    radius = float(circ.Radius())
+                    center = circ.Location().toTuple()[0][:3]
+                    circular_edges.append({"center": center, "radius": radius})
+            except Exception:
+                continue
 
-        # --- 3️⃣ Dubbele entries weghalen (zelfde locatie ±0.1mm)
+        # Combineer cirkels die op ±zelfde XY zitten (boven- en onderzijde)
+        matched = []
+        for i, c1 in enumerate(circular_edges):
+            for j, c2 in enumerate(circular_edges):
+                if i >= j:
+                    continue
+                dx = abs(c1["center"][0] - c2["center"][0])
+                dy = abs(c1["center"][1] - c2["center"][1])
+                dr = abs(c1["radius"] - c2["radius"])
+                if dx < 0.5 and dy < 0.5 and dr < 0.5:
+                    mid_z = (c1["center"][2] + c2["center"][2]) / 2
+                    holes.append({
+                        "x": round(c1["center"][0], 3),
+                        "y": round(c1["center"][1], 3),
+                        "z": round(mid_z, 3),
+                        "diameter": round(c1["radius"] * 2, 3)
+                    })
+                    matched.append(i)
+                    matched.append(j)
+                    break
+
+        # Als er geen matches zijn, voeg losse cilinders toe
+        if not holes:
+            for face in shape.Faces():
+                if face.geomType() == "CYLINDER":
+                    try:
+                        surf = face.Surface()
+                        radius = float(surf.Radius())
+                        loc = surf.Location().toTuple()[0][:3]
+                        holes.append({
+                            "x": round(loc[0], 3),
+                            "y": round(loc[1], 3),
+                            "z": round(loc[2], 3),
+                            "diameter": round(radius * 2, 3)
+                        })
+                    except Exception:
+                        continue
+
+        # Dubbele entries verwijderen
         unique = []
         for h in holes:
-            if not any(abs(h["x"] - u["x"]) < 0.1 and abs(h["y"] - u["y"]) < 0.1 and abs(h["z"] - u["z"]) < 0.1 for u in unique):
+            if not any(abs(h["x"] - u["x"]) < 0.1 and abs(h["y"] - u["y"]) < 0.1 for u in unique):
                 unique.append(h)
         holes = unique
 
