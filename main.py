@@ -166,7 +166,7 @@ async def analyze_step(file: UploadFile = File(...)):
             volume_mm3 = None
 
         # Gatdetectie
-        holes = detect_holes(shape)
+        holes = detect_mesh_holes(stl_path)
         holes_detected = len(holes)
 
         # Export + upload
