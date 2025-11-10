@@ -1,16 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import cadquery as cq
 import tempfile
 import os
 import traceback
+import trimesh
+import httpx
 from supabase import create_client, Client
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.6.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,8 +27,8 @@ app.add_middleware(
 # -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 supabase: Client | None = None
+
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -41,11 +43,10 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
-# -------------------------------
-# 🕳️ Gatdetectie helper + debug
-# -------------------------------
-import trimesh
 
+# -------------------------------
+# 🕳️ Gatdetectie helper (Trimesh)
+# -------------------------------
 def detect_mesh_holes(stl_path):
     """
     Detect holes from a triangulated STL mesh.
@@ -54,14 +55,12 @@ def detect_mesh_holes(stl_path):
     holes = []
     try:
         mesh = trimesh.load_mesh(stl_path)
-        boundaries = mesh.boundary_vertices
-        if len(boundaries) == 0:
+        boundaries = mesh.boundary_edges  # gebruik boundary_edges, niet boundary_vertices
+        if boundaries is None or len(boundaries) == 0:
             print("⚠️ No open boundaries found.")
             return holes
 
-        # groepeer losse loops
-        loops = mesh.boundary_edges
-        for loop in loops:
+        for loop in boundaries:
             pts = mesh.vertices[list(loop)]
             if len(pts) < 6:
                 continue
@@ -79,6 +78,7 @@ def detect_mesh_holes(stl_path):
         print("⚠️ Mesh hole detection failed:", e)
     return holes
 
+
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
@@ -89,7 +89,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
-        # Verwijder oud bestand
+        # Verwijder oud bestand (indien aanwezig)
         try:
             files = storage.list(path="analyzed")
             for f in files:
@@ -111,16 +111,18 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
 
+
 # -------------------------------
 # 🔍 Basis endpoints
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (incl. hole debug)"}
+    return {"message": "STEP analyzer live ✅ (CadQuery + STL + Trimesh holes + Supabase)"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # -------------------------------
 # 🧰 Hulpfunctie
@@ -132,6 +134,7 @@ def _ensure_step_extension(filename: str):
             status_code=415,
             detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
         )
+
 
 # -------------------------------
 # 🧮 Analyzer endpoint
@@ -148,9 +151,9 @@ async def analyze_step(file: UploadFile = File(...)):
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
 
-        # 🔎 debug-info
         print("🧠 Analyzing file:", file.filename)
 
+        # Bounding box
         bbox = shape.BoundingBox()
         raw_dims = {
             "x": round(float(bbox.xlen), 3),
@@ -160,21 +163,24 @@ async def analyze_step(file: UploadFile = File(...)):
         sorted_dims = sorted(raw_dims.values(), reverse=True)
         dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
+        # Volume
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
             volume_mm3 = None
 
-        # Gatdetectie
+        # Export STL
+        stl_path = tmp_path.replace(".step", ".stl")
+        cq.exporters.export(shape, stl_path, "STL")
+
+        # Hole detection (mesh)
         holes = detect_mesh_holes(stl_path)
         holes_detected = len(holes)
 
-        # Export + upload
-        stl_path = tmp_path.replace(".step", ".stl")
-        cq.exporters.export(shape, stl_path, "STL")
+        # Upload STL
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # Opslaan
+        # Opslaan in Supabase
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -213,12 +219,10 @@ async def analyze_step(file: UploadFile = File(...)):
             except Exception:
                 pass
 
-# -------------------------------
-# 🌐 Proxy endpoint voor CORS-vrije toegang tot STL-bestanden
-# -------------------------------
-from fastapi.responses import StreamingResponse
-import httpx
 
+# -------------------------------
+# 🌐 Proxy endpoint (CORS-fix voor STL viewer)
+# -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
     """
@@ -240,4 +244,3 @@ async def proxy_file(path: str):
     except Exception as e:
         print("⚠️ Proxy fetch failed:", e)
         return JSONResponse(status_code=500, content={"error": f"Proxy failed: {str(e)}"})
-
