@@ -45,56 +45,40 @@ else:
 # 🕳️ Gatdetectie helper + debug
 # -------------------------------
 def detect_holes(shape):
+    """
+    Detect circular holes in a solid by checking cylindrical faces that cut through the part.
+    Returns list of holes with coordinates and diameters.
+    """
     holes = []
     try:
-        print("🧩 Debug: aantal Faces =", len(shape.Faces()))
-        for f in shape.Faces():
-            try:
-                print("   →", f.geomType())
-            except Exception:
-                pass
-
-        print("🧩 Debug: aantal Edges =", len(shape.Edges()))
-        for e in shape.Edges()[:15]:
-            try:
-                print("   → Edge geomType:", e.geomType())
-            except Exception:
-                pass
-
-        # --- 1️⃣ Cylindrische oppervlakken
         for face in shape.Faces():
-            if face.geomType() == "CYLINDER":
+            surf_type = face.geomType()
+            if surf_type == "CYLINDER":
                 try:
                     surf = face.Surface()
                     radius = float(surf.Radius())
                     loc = surf.Location().toTuple()[0][:3]
-                    holes.append({
-                        "x": round(loc[0], 3),
-                        "y": round(loc[1], 3),
-                        "z": round(loc[2], 3),
-                        "diameter": round(radius * 2, 3)
-                    })
+
+                    # Controleer of het gat doorloopt (2 openingen)
+                    # alleen meenemen als radius < helft van kleinste bbox-as
+                    bbox = shape.BoundingBox()
+                    smallest_dim = min(bbox.xlen, bbox.ylen, bbox.zlen)
+                    if radius * 2 < smallest_dim * 0.8:  
+                        holes.append({
+                            "x": round(loc[0], 3),
+                            "y": round(loc[1], 3),
+                            "z": round(loc[2], 3),
+                            "diameter": round(radius * 2, 3)
+                        })
                 except Exception:
                     continue
 
-        # --- 2️⃣ Cirkelranden
-        for edge in shape.Edges():
-            try:
-                t = edge.geomType()
-                if t == "CIRCLE":
-                    circ = edge._geomAdaptor().Circle()
-                    radius = float(circ.Radius())
-                    center = circ.Location().toTuple()[0][:3]
-                    holes.append({
-                        "x": round(center[0], 3),
-                        "y": round(center[1], 3),
-                        "z": round(center[2], 3),
-                        "diameter": round(radius * 2, 3)
-                    })
-            except Exception:
-                continue
-
-        print("🕳️ Gaten gevonden (debug):", holes)
+        # Dubbele entries filteren (zelfde XY)
+        unique = []
+        for h in holes:
+            if not any(abs(h["x"] - u["x"]) < 0.1 and abs(h["y"] - u["y"]) < 0.1 for u in unique):
+                unique.append(h)
+        holes = unique
 
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
