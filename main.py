@@ -44,44 +44,47 @@ else:
 # -------------------------------
 # 🕳️ Gatdetectie helper + debug
 # -------------------------------
-def detect_holes(shape):
+
     """
-    Detect circular holes in a solid by checking cylindrical faces that cut through the part.
-    Returns list of holes with coordinates and diameters.
+    Detect holes by checking circular edges on planar faces.
+    Werkt voor typische plaatdelen met ronde gaten.
     """
     holes = []
     try:
         for face in shape.Faces():
-            surf_type = face.geomType()
-            if surf_type == "CYLINDER":
-                try:
-                    surf = face.Surface()
-                    radius = float(surf.Radius())
-                    loc = surf.Location().toTuple()[0][:3]
+            if face.geomType() != "PLANE":
+                continue
 
-                    # Controleer of het gat doorloopt (2 openingen)
-                    # alleen meenemen als radius < helft van kleinste bbox-as
-                    bbox = shape.BoundingBox()
-                    smallest_dim = min(bbox.xlen, bbox.ylen, bbox.zlen)
-                    if radius * 2 < smallest_dim * 0.8:  
-                        holes.append({
-                            "x": round(loc[0], 3),
-                            "y": round(loc[1], 3),
-                            "z": round(loc[2], 3),
-                            "diameter": round(radius * 2, 3)
-                        })
+            # Check de edges van elke vlak
+            for edge in face.Edges():
+                try:
+                    if edge.geomType() == "CIRCLE":
+                        circ = edge._geomAdaptor().Circle()
+                        radius = float(circ.Radius())
+                        center = circ.Location().toTuple()[0][:3]
+
+                        # Filter alleen gaten van redelijke grootte (niet minuscule rondingen)
+                        if radius > 0.5:  
+                            holes.append({
+                                "x": round(center[0], 3),
+                                "y": round(center[1], 3),
+                                "z": round(center[2], 3),
+                                "diameter": round(radius * 2, 3)
+                            })
                 except Exception:
                     continue
 
-        # Dubbele entries filteren (zelfde XY)
+        # Dubbele entries (boven/onder) samenvoegen
         unique = []
         for h in holes:
-            if not any(abs(h["x"] - u["x"]) < 0.1 and abs(h["y"] - u["y"]) < 0.1 for u in unique):
+            if not any(abs(h["x"] - u["x"]) < 0.2 and abs(h["y"] - u["y"]) < 0.2 for u in unique):
                 unique.append(h)
         holes = unique
 
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
+
+    print(f"🕳️ Detected {len(holes)} holes")
     return holes
 
 # -------------------------------
