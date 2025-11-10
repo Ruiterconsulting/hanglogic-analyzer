@@ -46,25 +46,40 @@ else:
 # -------------------------------
 def detect_holes(shape):
     """
-    Detect holes by checking circular edges on planar faces.
-    Werkt voor typische plaatdelen met ronde gaten.
+    Detect holes or cylindrical cutouts by inspecting cylindrical faces,
+    and fallback to circular edges on planar faces.
     """
     holes = []
     try:
+        # 1️⃣ Eerst: probeer cilindrische vlakken te vinden (echte boorgaten)
+        for face in shape.Faces():
+            try:
+                surf = face.Surface()
+                surf_type = surf.GetType()  # bijv. Geom_CylindricalSurface
+                if "Cylindrical" in str(surf_type):
+                    radius = float(surf.Radius())
+                    loc = surf.Location().toTuple()[0][:3]
+                    if 0.5 < radius < 100:  # filter minuscule of rare vormen
+                        holes.append({
+                            "x": round(loc[0], 3),
+                            "y": round(loc[1], 3),
+                            "z": round(loc[2], 3),
+                            "diameter": round(radius * 2, 3)
+                        })
+            except Exception:
+                continue
+
+        # 2️⃣ Fallback: cirkelranden op vlakken (voor STEP’s zonder cylinders)
         for face in shape.Faces():
             if face.geomType() != "PLANE":
                 continue
-
-            # Check de edges van elke vlak
             for edge in face.Edges():
                 try:
                     if edge.geomType() == "CIRCLE":
                         circ = edge._geomAdaptor().Circle()
                         radius = float(circ.Radius())
                         center = circ.Location().toTuple()[0][:3]
-
-                        # Filter alleen gaten van redelijke grootte (niet minuscule rondingen)
-                        if radius > 0.5:  
+                        if radius > 0.5:
                             holes.append({
                                 "x": round(center[0], 3),
                                 "y": round(center[1], 3),
@@ -74,10 +89,13 @@ def detect_holes(shape):
                 except Exception:
                     continue
 
-        # Dubbele entries (boven/onder) samenvoegen
+        # 3️⃣ Dubbele entries samenvoegen (boven/onderzijde)
         unique = []
         for h in holes:
-            if not any(abs(h["x"] - u["x"]) < 0.2 and abs(h["y"] - u["y"]) < 0.2 for u in unique):
+            if not any(
+                abs(h["x"] - u["x"]) < 0.2 and abs(h["y"] - u["y"]) < 0.2
+                for u in unique
+            ):
                 unique.append(h)
         holes = unique
 
@@ -86,6 +104,7 @@ def detect_holes(shape):
 
     print(f"🕳️ Detected {len(holes)} holes")
     return holes
+
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
