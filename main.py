@@ -44,53 +44,39 @@ else:
 # -------------------------------
 # 🕳️ Gatdetectie helper + debug
 # -------------------------------
-def detect_holes(shape):
+import trimesh
+
+def detect_mesh_holes(stl_path):
     """
-    Detect through-holes in a solid by analyzing cylindrical faces that
-    have matching opposing parallel faces (typical for drilled holes).
-    Returns a list of holes with center and diameter.
+    Detect holes from a triangulated STL mesh.
+    Finds circular boundary loops (through-holes).
     """
     holes = []
     try:
-        # Verzamel alle cilindervlakken
-        cyl_faces = []
-        for face in shape.Faces():
-            try:
-                surf = face.Surface()
-                if "Cylindrical" in str(surf.GetType()):
-                    radius = float(surf.Radius())
-                    loc = surf.Location().toTuple()[0][:3]
-                    axis = surf.Axis().Direction().toTuple()[0][:3]
-                    cyl_faces.append({"radius": radius, "loc": loc, "axis": axis})
-            except Exception:
+        mesh = trimesh.load_mesh(stl_path)
+        boundaries = mesh.boundary_vertices
+        if len(boundaries) == 0:
+            print("⚠️ No open boundaries found.")
+            return holes
+
+        # groepeer losse loops
+        loops = mesh.boundary_edges
+        for loop in loops:
+            pts = mesh.vertices[list(loop)]
+            if len(pts) < 6:
                 continue
-
-        # Combineer cilinders die tegengesteld georiënteerd zijn (doorlopend)
-        for i, f1 in enumerate(cyl_faces):
-            for j, f2 in enumerate(cyl_faces):
-                if i >= j:
-                    continue
-
-                # radius bijna gelijk?
-                if abs(f1["radius"] - f2["radius"]) < 0.1:
-                    # axis tegengesteld?
-                    dot = sum(a * b for a, b in zip(f1["axis"], f2["axis"]))
-                    if dot < -0.9:  # bijna tegenovergesteld
-                        x = round((f1["loc"][0] + f2["loc"][0]) / 2, 3)
-                        y = round((f1["loc"][1] + f2["loc"][1]) / 2, 3)
-                        z = round((f1["loc"][2] + f2["loc"][2]) / 2, 3)
-                        holes.append({
-                            "x": x,
-                            "y": y,
-                            "z": z,
-                            "diameter": round(f1["radius"] * 2, 3)
-                        })
-                        break
-
-        print(f"🕳️ Detected {len(holes)} through-holes")
+            center = pts.mean(axis=0)
+            dists = ((pts - center) ** 2).sum(axis=1) ** 0.5
+            diameter = 2 * dists.mean()
+            holes.append({
+                "x": round(float(center[0]), 3),
+                "y": round(float(center[1]), 3),
+                "z": round(float(center[2]), 3),
+                "diameter": round(float(diameter), 3)
+            })
+        print(f"🕳️ Detected {len(holes)} mesh holes")
     except Exception as e:
-        print("⚠️ Hole detection failed:", e)
-
+        print("⚠️ Mesh hole detection failed:", e)
     return holes
 
 # -------------------------------
