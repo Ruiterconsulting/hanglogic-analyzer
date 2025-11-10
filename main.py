@@ -44,7 +44,7 @@ else:
 # -------------------------------
 # 🕳️ Gatdetectie helper + debug
 # -------------------------------
-
+def detect_holes(shape):
     """
     Detect holes by checking circular edges on planar faces.
     Werkt voor typische plaatdelen met ronde gaten.
@@ -86,7 +86,6 @@ else:
 
     print(f"🕳️ Detected {len(holes)} holes")
     return holes
-
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
