@@ -233,3 +233,32 @@ async def analyze_step(file: UploadFile = File(...)):
                     os.remove(path)
             except Exception:
                 pass
+
+# -------------------------------
+# 🌐 Proxy endpoint voor CORS-vrije toegang tot STL-bestanden
+# -------------------------------
+from fastapi.responses import StreamingResponse
+import httpx
+
+@app.get("/proxy/{path:path}")
+async def proxy_file(path: str):
+    """
+    Haalt STL-bestand op van Supabase Storage en voegt juiste CORS headers toe.
+    Hierdoor kan Lovable het model rechtstreeks renderen.
+    """
+    url = f"https://sywnjytfygvotskufvzs.supabase.co/storage/v1/object/public/{path}"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url)
+            r.raise_for_status()
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Content-Type": r.headers.get("content-type", "application/octet-stream"),
+        }
+        return StreamingResponse(iter([r.content]), headers=headers)
+    except Exception as e:
+        print("⚠️ Proxy fetch failed:", e)
+        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {str(e)}"})
+
