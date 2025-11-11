@@ -5,14 +5,13 @@ import cadquery as cq
 import tempfile
 import os
 import traceback
-import trimesh
 import httpx
 from supabase import create_client, Client
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.7.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,37 +44,68 @@ else:
 
 
 # -------------------------------
-# 🕳️ Gatdetectie helper (Trimesh)
+# 🕳️ Gatdetectie helper (CadQuery)
 # -------------------------------
-def detect_mesh_holes(stl_path):
+def detect_cylindrical_holes(shape):
     """
-    Detect holes from a triangulated STL mesh.
-    Finds circular boundary loops (through-holes).
+    Detecteert cilinders in het model (gesloten of doorlopende gaten).
+    Combineert boven- en onderzijden tot één gat.
+    Retourneert lijst met {x, y, z, diameter}.
     """
     holes = []
     try:
-        mesh = trimesh.load_mesh(stl_path)
-        boundaries = mesh.boundary_edges  # gebruik boundary_edges, niet boundary_vertices
-        if boundaries is None or len(boundaries) == 0:
-            print("⚠️ No open boundaries found.")
-            return holes
-
-        for loop in boundaries:
-            pts = mesh.vertices[list(loop)]
-            if len(pts) < 6:
+        cyl_faces = []
+        for face in shape.Faces():
+            try:
+                if face.geomType() == "CYLINDER":
+                    surf = face.Surface()
+                    radius = float(surf.Radius())
+                    loc = surf.Location().toTuple()[0][:3]
+                    cyl_faces.append({
+                        "x": round(loc[0], 3),
+                        "y": round(loc[1], 3),
+                        "z": round(loc[2], 3),
+                        "radius": round(radius, 3)
+                    })
+            except Exception:
                 continue
-            center = pts.mean(axis=0)
-            dists = ((pts - center) ** 2).sum(axis=1) ** 0.5
-            diameter = 2 * dists.mean()
-            holes.append({
-                "x": round(float(center[0]), 3),
-                "y": round(float(center[1]), 3),
-                "z": round(float(center[2]), 3),
-                "diameter": round(float(diameter), 3)
-            })
-        print(f"🕳️ Detected {len(holes)} mesh holes")
+
+        # Combineer cilinders met dezelfde XY (boven/onder)
+        used = set()
+        for i, f1 in enumerate(cyl_faces):
+            if i in used:
+                continue
+            for j, f2 in enumerate(cyl_faces):
+                if i >= j or j in used:
+                    continue
+                dx = abs(f1["x"] - f2["x"])
+                dy = abs(f1["y"] - f2["y"])
+                dr = abs(f1["radius"] - f2["radius"])
+                if dx < 0.5 and dy < 0.5 and dr < 0.2:
+                    z_mid = (f1["z"] + f2["z"]) / 2
+                    holes.append({
+                        "x": f1["x"],
+                        "y": f1["y"],
+                        "z": round(z_mid, 3),
+                        "diameter": round(f1["radius"] * 2, 3)
+                    })
+                    used.add(i)
+                    used.add(j)
+                    break
+
+        # Voeg losse cilinders toe (bijv. blinde gaten)
+        for i, f in enumerate(cyl_faces):
+            if i not in used:
+                holes.append({
+                    "x": f["x"],
+                    "y": f["y"],
+                    "z": f["z"],
+                    "diameter": round(f["radius"] * 2, 3)
+                })
+
+        print(f"🕳️ Detected {len(holes)} cylindrical holes")
     except Exception as e:
-        print("⚠️ Mesh hole detection failed:", e)
+        print("⚠️ Hole detection failed:", e)
     return holes
 
 
@@ -89,7 +119,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
-        # Verwijder oud bestand (indien aanwezig)
+        # Verwijder oud bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
@@ -117,7 +147,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (CadQuery + STL + Trimesh holes + Supabase)"}
+    return {"message": "STEP analyzer live ✅ (CadQuery + Cylindrical holes + Supabase)"}
 
 @app.get("/health")
 def health():
@@ -173,8 +203,8 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # Hole detection (mesh)
-        holes = detect_mesh_holes(stl_path)
+        # Hole detection (via CadQuery)
+        holes = detect_cylindrical_holes(shape)
         holes_detected = len(holes)
 
         # Upload STL
@@ -221,7 +251,7 @@ async def analyze_step(file: UploadFile = File(...)):
 
 
 # -------------------------------
-# 🌐 Proxy endpoint (CORS-fix voor STL viewer)
+# 🌐 Proxy endpoint (CORS-fix)
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
