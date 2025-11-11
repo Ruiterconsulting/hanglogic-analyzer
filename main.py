@@ -47,14 +47,13 @@ else:
 # -------------------------------
 def detect_analytic_holes(shape):
     """
-    Detecteert ronde gaten en combineert dubbele detecties.
-    Filtert op diameter en positie.
+    Detecteert echte ronde gaten en filtert countersinks / oppervlakkige cirkels weg.
     """
     holes = []
     try:
         circle_faces = []
 
-        # Verzamel alle cirkels
+        # Verzamel cirkels uit alle vlakken
         for face in shape.Faces():
             for edge in face.Edges():
                 if edge.geomType() == "CIRCLE":
@@ -64,34 +63,38 @@ def detect_analytic_holes(shape):
                     radius = round(circ.Radius(), 3)
                     circle_faces.append({"center": center, "radius": radius})
 
-        # Combineer cirkels die vrijwel op dezelfde plek zitten
-        merged = []
+        # Combineer cirkels die vrijwel op dezelfde XY zitten
+        combined = []
         for circ in circle_faces:
-            # Diameter berekenen
             diameter = circ["radius"] * 2
-
-            # 🔹 Filter op realistische gaten (bijv. tussen 2 en 15 mm)
             if not (2.0 <= diameter <= 15.0):
                 continue
 
             cx, cy, cz = circ["center"]
             match = next(
-                (m for m in merged if abs(m["x"] - cx) < 0.5 and abs(m["y"] - cy) < 0.5 and abs(m["diameter"] - diameter) < 0.5),
+                (m for m in combined if abs(m["x"] - cx) < 0.5 and abs(m["y"] - cy) < 0.5),
                 None,
             )
+
             if match:
-                # Combineer (gemiddelde z)
-                match["z"] = round((match["z"] + cz) / 2, 3)
+                # Combineer boven/onderzijde → echte doorlopers
+                z_diff = abs(match["z"] - cz)
+                d_diff = abs(match["diameter"] - diameter)
+                if z_diff > 1.0 and d_diff < 1.0:
+                    match["z"] = round((match["z"] + cz) / 2, 3)
+                # ⚙️ countersinks (grotere diameter, dicht bij Z) → negeren
+                elif d_diff > 0.5 and z_diff < 1.0:
+                    continue
             else:
-                merged.append({
+                combined.append({
                     "x": cx,
                     "y": cy,
                     "z": cz,
                     "diameter": round(diameter, 3)
                 })
 
-        holes = merged
-        print(f"🕳️ Detected {len(holes)} unique filtered holes")
+        holes = combined
+        print(f"🕳️ Detected {len(holes)} refined holes")
 
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
