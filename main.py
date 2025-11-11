@@ -47,14 +47,14 @@ else:
 # -------------------------------
 def detect_analytic_holes(shape):
     """
-    Detects real through-holes and filters out countersinks or surface circles.
-    Returns clean hole list with X, Y, Z, diameter.
+    Detects true through-holes and filters out countersinks or rounded edges.
+    Returns clean list of holes with X, Y, Z, and diameter.
     """
     holes = []
     try:
         circle_faces = []
 
-        # 1️⃣ Verzamel alle cirkels
+        # 1️⃣ Collect all circular edges
         for face in shape.Faces():
             for edge in face.Edges():
                 if edge.geomType() == "CIRCLE":
@@ -68,43 +68,33 @@ def detect_analytic_holes(shape):
                     radius = round(circ.Radius(), 3)
                     circle_faces.append({"center": center, "radius": radius})
 
-        # 2️⃣ Combineer cirkels die op zelfde XY zitten
-        merged = []
+        # 2️⃣ Merge circles with nearly same XY coordinates
+        grouped = {}
         for circ in circle_faces:
-            diameter = circ["radius"] * 2
+            cx, cy, cz = circ["center"]
+            diameter = round(circ["radius"] * 2, 3)
             if not (2.0 <= diameter <= 15.0):
                 continue
 
-            cx, cy, cz = circ["center"]
-            # Zoek een match in XY
-            match = next(
-                (
-                    m
-                    for m in merged
-                    if abs(m["x"] - cx) < 0.5
-                    and abs(m["y"] - cy) < 0.5
-                ),
-                None,
-            )
+            # key = XY position rounded to 0.5mm grid
+            key = (round(cx * 2) / 2.0, round(cy * 2) / 2.0)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append({"z": cz, "diameter": diameter})
 
-            if match:
-                z_diff = abs(match["z"] - cz)
-                d_diff = abs(match["diameter"] - diameter)
+        # 3️⃣ For each XY, pick the smallest diameter (filters countersinks)
+        for (gx, gy), values in grouped.items():
+            if not values:
+                continue
+            smallest = min(values, key=lambda v: v["diameter"])
+            holes.append({
+                "x": round(gx, 3),
+                "y": round(gy, 3),
+                "z": round(smallest["z"], 3),
+                "diameter": round(smallest["diameter"], 3)
+            })
 
-                # ⛔ Countersink: grotere cirkel vlakbij kleinere → negeer
-                if d_diff > 0.5 and z_diff < 2.0:
-                    continue
-
-                # ✅ Echte doorboring: combineer boven/onder
-                if z_diff > 1.0 and d_diff < 1.0:
-                    match["z"] = round((match["z"] + cz) / 2, 3)
-            else:
-                merged.append(
-                    {"x": cx, "y": cy, "z": cz, "diameter": round(diameter, 3)}
-                )
-
-        holes = merged
-        print(f"🕳️ Detected {len(holes)} filtered through-holes")
+        print(f"🕳️ Detected {len(holes)} final clean through-holes")
 
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
