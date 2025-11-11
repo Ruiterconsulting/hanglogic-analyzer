@@ -4,18 +4,19 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import cadquery as cq
 import tempfile
 import os
+import math
 import traceback
-import httpx
 from supabase import create_client, Client
+import httpx
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # eventueel beperken tot jouw Lovable domeinen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,62 +44,104 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🕳️ Hole detection via CadQuery faces
+# 🕳️ Strikte Gatdetectie
 # -------------------------------
-def detect_analytic_holes(shape):
+def detect_analytic_holes_strict(shape,
+                                 d_min=2.0, d_max=30.0,
+                                 xy_tol=0.2, d_tol=0.2,
+                                 z_pair_min=1.0, z_pair_max=40.0,
+                                 full_circle_tol_ratio=0.02):
     """
-    Detects true through-holes and filters out countersinks or rounded edges.
-    Returns clean list of holes with X, Y, Z, and diameter.
+    Detecteert echte doorlopende ronde gaten en filtert:
+    - boogsegmenten (géén volledige 360°)
+    - countersinks / ruimingen
+    - losse cirkels zonder tegenhanger
+    Retourneert lijst met {x,y,z,diameter} (z = gemiddelde van boven/onder).
     """
+
+    circles = []  # (cx, cy, cz, diameter)
+    for face in shape.Faces():
+        for edge in face.Edges():
+            if edge.geomType() != "CIRCLE":
+                continue
+            try:
+                circ = edge._geomAdaptor().Circle()
+                loc = circ.Location()
+                r = float(circ.Radius())
+                if r <= 0:
+                    continue
+
+                # check volledige cirkel: lengte ≈ 2πr
+                L = float(edge.Length())
+                if L <= 0:
+                    continue
+                full_L = 2.0 * math.pi * r
+                if abs(L - full_L) > full_circle_tol_ratio * full_L:
+                    # hoogstwaarschijnlijk een boogdeel → overslaan
+                    continue
+
+                cx, cy, cz = float(loc.X()), float(loc.Y()), float(loc.Z())
+                d = 2.0 * r
+
+                if not (d_min <= d <= d_max):
+                    continue
+
+                circles.append((round(cx, 3), round(cy, 3), round(cz, 3), round(d, 3)))
+            except Exception:
+                continue
+
+    if not circles:
+        print("🕳️ No full-circle edges found.")
+        return []
+
+    # 2️⃣ Groepeer op XY & diameter
+    groups = []
+    for cx, cy, cz, d in circles:
+        placed = False
+        for g in groups:
+            if (abs(g["x"] - cx) <= xy_tol and
+                abs(g["y"] - cy) <= xy_tol and
+                abs(g["d"] - d) <= d_tol):
+                g["zs"].append(cz)
+                placed = True
+                break
+        if not placed:
+            groups.append({"x": cx, "y": cy, "d": d, "zs": [cz]})
+
+    # 3️⃣ Zoek echte paren (boven/onderzijde)
     holes = []
-    try:
-        circle_faces = []
+    for g in groups:
+        zs = sorted(g["zs"])
+        if len(zs) < 2:
+            continue
 
-        # 1️⃣ Collect all circular edges
-        for face in shape.Faces():
-            for edge in face.Edges():
-                if edge.geomType() == "CIRCLE":
-                    circ = edge._geomAdaptor().Circle()
-                    loc = circ.Location()
-                    center = (
-                        round(loc.X(), 3),
-                        round(loc.Y(), 3),
-                        round(loc.Z(), 3),
-                    )
-                    radius = round(circ.Radius(), 3)
-                    circle_faces.append({"center": center, "radius": radius})
+        found = False
+        for i in range(len(zs)):
+            for j in range(i + 1, len(zs)):
+                dz = abs(zs[j] - zs[i])
+                if z_pair_min <= dz <= z_pair_max:
+                    z_avg = round((zs[i] + zs[j]) / 2.0, 3)
+                    holes.append({
+                        "x": round(g["x"], 3),
+                        "y": round(g["y"], 3),
+                        "z": z_avg,
+                        "diameter": round(g["d"], 3)
+                    })
+                    found = True
+                    break
+            if found:
+                break
 
-        # 2️⃣ Merge circles with nearly same XY coordinates
-        grouped = {}
-        for circ in circle_faces:
-            cx, cy, cz = circ["center"]
-            diameter = round(circ["radius"] * 2, 3)
-            if not (2.0 <= diameter <= 15.0):
-                continue
+    # 4️⃣ Duplicaten verwijderen
+    deduped = []
+    for h in holes:
+        if not any(abs(h["x"] - u["x"]) <= xy_tol and
+                   abs(h["y"] - u["y"]) <= xy_tol and
+                   abs(h["diameter"] - u["diameter"]) <= d_tol for u in deduped):
+            deduped.append(h)
 
-            # key = XY position rounded to 0.5mm grid
-            key = (round(cx * 2) / 2.0, round(cy * 2) / 2.0)
-            if key not in grouped:
-                grouped[key] = []
-            grouped[key].append({"z": cz, "diameter": diameter})
-
-        # 3️⃣ For each XY, pick the smallest diameter (filters countersinks)
-        for (gx, gy), values in grouped.items():
-            if not values:
-                continue
-            smallest = min(values, key=lambda v: v["diameter"])
-            holes.append({
-                "x": round(gx, 3),
-                "y": round(gy, 3),
-                "z": round(smallest["z"], 3),
-                "diameter": round(smallest["diameter"], 3)
-            })
-
-        print(f"🕳️ Detected {len(holes)} final clean through-holes")
-
-    except Exception as e:
-        print("⚠️ Hole detection failed:", e)
-    return holes
+    print(f"🕳️ Detected {len(deduped)} clean through-holes (strict).")
+    return deduped
 
 # -------------------------------
 # 📦 Upload helper
@@ -110,23 +153,49 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
-        # Verwijder eventueel bestaand bestand
+        # verwijder oud bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
                 name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
                 if name == remote_name:
+                    print(f"⚠️ Bestand {remote_name} bestaat al — verwijderen...")
                     storage.remove([f"analyzed/{remote_name}"])
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            print("ℹ️ Geen bestaande bestanden gevonden:", e)
 
         with open(local_path, "rb") as f:
-            storage.upload(remote_path, f)
+            res = storage.upload(remote_path, f)
+        print("✅ Upload gelukt:", res)
 
-        return storage.get_public_url(remote_path)
+        public_url = storage.get_public_url(remote_path)
+        print("🌍 Public URL:", public_url)
+        return public_url
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
+
+# -------------------------------
+# 🔍 Basis endpoints
+# -------------------------------
+@app.get("/")
+def root():
+    return {"message": "STEP analyzer live ✅ (v1.7.0 strict holes + STL export)"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# -------------------------------
+# 🧰 Bestandstype check
+# -------------------------------
+def _ensure_step_extension(filename: str):
+    ext = (os.path.splitext(filename)[1] or "").lower()
+    if ext not in [".step", ".stp"]:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
+        )
 
 # -------------------------------
 # 🧮 Analyzer endpoint
@@ -135,66 +204,65 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
     try:
-        if not file.filename.lower().endswith((".step", ".stp")):
-            raise HTTPException(status_code=415, detail="Only .STEP/.STP allowed")
-
-        # Tijdelijk opslaan
+        _ensure_step_extension(file.filename)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Inladen en analyseren
+        # 1️⃣ STEP importeren
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
+        print(f"🧠 Analyzing: {file.filename}")
 
+        # 2️⃣ Bounding box
         bbox = shape.BoundingBox()
-        dims = {
-            "X": round(float(bbox.xlen), 3),
-            "Y": round(float(bbox.ylen), 3),
-            "Z": round(float(bbox.zlen), 3)
-        }
+        raw_dims = {"x": round(bbox.xlen, 3), "y": round(bbox.ylen, 3), "z": round(bbox.zlen, 3)}
+        sorted_dims = sorted(raw_dims.values(), reverse=True)
+        dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
+        # 3️⃣ Volume
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
             volume_mm3 = None
 
-        # Hole detection
-        holes = detect_analytic_holes(shape)
+        # 4️⃣ Hole detection
+        holes = detect_analytic_holes_strict(shape)
         holes_detected = len(holes)
 
-        # STL export
+        # 5️⃣ STL exporteren
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
+
+        # 6️⃣ Upload
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # Supabase DB insert
+        # 7️⃣ Opslaan in Supabase database
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "dimensions": dims,
+                "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
                 "holes_detected": holes_detected,
                 "holes_data": holes,
+                "created_at": "now()",
                 "units": "mm",
                 "bounding_box_x": dims["X"],
                 "bounding_box_y": dims["Y"],
                 "bounding_box_z": dims["Z"],
                 "model_url": stl_public_url,
-                "created_at": "now()",
             }).execute()
 
-        return JSONResponse(
-            content={
-                "status": "success",
-                "units": "mm",
-                "boundingBoxMM": dims,
-                "volumeMM3": volume_mm3,
-                "filename": file.filename,
-                "holesDetected": holes_detected,
-                "holes": holes,
-                "modelURL": stl_public_url,
-            }
-        )
+        # 8️⃣ Resultaat terugsturen
+        return JSONResponse(content={
+            "status": "success",
+            "units": "mm",
+            "boundingBoxMM": dims,
+            "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
+            "filename": file.filename,
+            "holesDetected": holes_detected,
+            "holes": holes,
+            "modelURL": stl_public_url,
+        })
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
@@ -208,7 +276,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 pass
 
 # -------------------------------
-# 🌐 Proxy endpoint (CORS)
+# 🌐 Proxy voor CORS
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
@@ -225,4 +293,5 @@ async def proxy_file(path: str):
         }
         return StreamingResponse(iter([r.content]), headers=headers)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {e}"})
+        print("⚠️ Proxy fetch failed:", e)
+        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {str(e)}"})
