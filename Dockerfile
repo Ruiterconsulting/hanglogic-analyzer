@@ -1,36 +1,53 @@
-# Gebruik een volledige image met meer systeemondersteuning
-FROM python:3.11-bullseye
+# ============================================================
+# 🧰 Base image
+# ============================================================
+FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Installeer Linux dependencies die CadQuery / OpenCascade nodig hebben
-RUN apt-get update && apt-get install -y --fix-missing \
+# ============================================================
+# ⚙️ System dependencies for CadQuery / OCC / Shapely / Trimesh
+# ============================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    python3-dev \
     libgl1-mesa-glx \
-    libglu1-mesa \
     libxrender1 \
     libxext6 \
     libsm6 \
-    libglib2.0-0 \
-    wget \
-    curl \
+    libfreetype6 \
+    libxft2 \
+    libjpeg-dev \
+    libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Stel de werkdirectory in
+# ============================================================
+# 📦 Set working directory
+# ============================================================
 WORKDIR /app
 
-# Kopieer de vereisten
+# ============================================================
+# 📥 Copy requirements
+# ============================================================
 COPY requirements.txt .
 
-# Installeer Python dependencies
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# ============================================================
+# 📦 Install Python dependencies
+# ============================================================
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Kopieer de applicatie
-COPY main.py .
+# ============================================================
+# 📂 Copy application files
+# ============================================================
+COPY . .
 
-# Poort openstellen
-EXPOSE 8080
+# ============================================================
+# 🌍 Environment variables (for Render)
+# ============================================================
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PORT=8080
 
-# Start de FastAPI-server
+# ============================================================
+# 🚀 Run the FastAPI app
+# ============================================================
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
