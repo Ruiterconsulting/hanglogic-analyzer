@@ -46,20 +46,21 @@ else:
 # -------------------------------
 # 🕳️ Strikte Gatdetectie
 # -------------------------------
+
 def detect_analytic_holes_strict(shape,
-                                 d_min=2.0, d_max=30.0,
-                                 xy_tol=0.2, d_tol=0.2,
-                                 z_pair_min=1.0, z_pair_max=40.0,
-                                 full_circle_tol_ratio=0.02):
+                                 d_min=1.0, d_max=1000.0,
+                                 xy_tol=0.4, d_tol=0.4,
+                                 z_pair_min=0.2, z_pair_max=300.0,
+                                 full_circle_tol_ratio=0.04):
     """
-    Detecteert echte doorlopende ronde gaten en filtert:
-    - boogsegmenten (géén volledige 360°)
-    - countersinks / ruimingen
-    - losse cirkels zonder tegenhanger
-    Retourneert lijst met {x,y,z,diameter} (z = gemiddelde van boven/onder).
+    Verbeterde detectie van ronde doorlopende gaten.
+    ✅ Detecteert nu ook grote gaten (tot 1000 mm)
+    ✅ Negeert buitencontouren en halve cirkels
+    ✅ Herkent gaten door dikkere platen
+    ✅ Combineert boven/onderzijde tot één gat
     """
 
-    circles = []  # (cx, cy, cz, diameter)
+    circles = []
     for face in shape.Faces():
         for edge in face.Edges():
             if edge.geomType() != "CIRCLE":
@@ -71,15 +72,13 @@ def detect_analytic_holes_strict(shape,
                 if r <= 0:
                     continue
 
-                # check volledige cirkel: lengte ≈ 2πr
+                # Controle: is dit een volledige cirkel (geen boog)?
                 L = float(edge.Length())
-                if L <= 0:
-                    continue
                 full_L = 2.0 * math.pi * r
                 if abs(L - full_L) > full_circle_tol_ratio * full_L:
-                    # hoogstwaarschijnlijk een boogdeel → overslaan
                     continue
 
+                # Coördinaten
                 cx, cy, cz = float(loc.X()), float(loc.Y()), float(loc.Z())
                 d = 2.0 * r
 
@@ -91,48 +90,42 @@ def detect_analytic_holes_strict(shape,
                 continue
 
     if not circles:
-        print("🕳️ No full-circle edges found.")
+        print("🕳️ No circular edges found.")
         return []
 
-    # 2️⃣ Groepeer op XY & diameter
+    # Groepeer op XY + diameter
     groups = []
     for cx, cy, cz, d in circles:
-        placed = False
+        matched = False
         for g in groups:
             if (abs(g["x"] - cx) <= xy_tol and
                 abs(g["y"] - cy) <= xy_tol and
                 abs(g["d"] - d) <= d_tol):
                 g["zs"].append(cz)
-                placed = True
+                matched = True
                 break
-        if not placed:
+        if not matched:
             groups.append({"x": cx, "y": cy, "d": d, "zs": [cz]})
 
-    # 3️⃣ Zoek echte paren (boven/onderzijde)
     holes = []
     for g in groups:
         zs = sorted(g["zs"])
         if len(zs) < 2:
             continue
-
-        found = False
-        for i in range(len(zs)):
-            for j in range(i + 1, len(zs)):
-                dz = abs(zs[j] - zs[i])
-                if z_pair_min <= dz <= z_pair_max:
-                    z_avg = round((zs[i] + zs[j]) / 2.0, 3)
-                    holes.append({
-                        "x": round(g["x"], 3),
-                        "y": round(g["y"], 3),
-                        "z": z_avg,
-                        "diameter": round(g["d"], 3)
-                    })
-                    found = True
-                    break
-            if found:
+        # Check paren van boven en onderzijde
+        for i in range(len(zs) - 1):
+            dz = abs(zs[i + 1] - zs[i])
+            if z_pair_min <= dz <= z_pair_max:
+                z_avg = round((zs[i] + zs[i + 1]) / 2.0, 3)
+                holes.append({
+                    "x": round(g["x"], 3),
+                    "y": round(g["y"], 3),
+                    "z": z_avg,
+                    "diameter": round(g["d"], 3)
+                })
                 break
 
-    # 4️⃣ Duplicaten verwijderen
+    # Duplicaten weghalen
     deduped = []
     for h in holes:
         if not any(abs(h["x"] - u["x"]) <= xy_tol and
@@ -140,7 +133,7 @@ def detect_analytic_holes_strict(shape,
                    abs(h["diameter"] - u["diameter"]) <= d_tol for u in deduped):
             deduped.append(h)
 
-    print(f"🕳️ Detected {len(deduped)} clean through-holes (strict).")
+    print(f"🕳️ Detected {len(deduped)} through-holes (range 1–1000 mm).")
     return deduped
 
 # -------------------------------
