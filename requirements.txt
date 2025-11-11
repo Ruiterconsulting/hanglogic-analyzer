@@ -1,29 +1,8 @@
-# -------------------------------
-# 🔧 Core framework
-# -------------------------------
-fastapi==0.115.0
+fastapi==0.111.0
 uvicorn==0.30.6
-httpx==0.27.2
-
-# -------------------------------
-# 🧮 Geometry & 3D tools
-# -------------------------------
-cadquery==2.6.1
-trimesh==4.4.9
-shapely==2.0.4
+cadquery==2.4.0
 numpy==1.26.4
-
-# -------------------------------
-# ☁️ Database & storage
-# -------------------------------
-supabase==2.4.0
-postgrest==0.13.0
-gotrue==2.4.0
-storage3==0.7.0
-realtime==1.0.0
-
-# -------------------------------
-# 🧰 Utilities
-# -------------------------------
-python-multipart==0.0.9
-typing-extensions==4.12.2
+supabase==2.6.0
+python-multipart>=0.0.7
+jinja2>=3.1.2
+trimesh==4.3.1
