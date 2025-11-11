@@ -47,54 +47,64 @@ else:
 # -------------------------------
 def detect_analytic_holes(shape):
     """
-    Detecteert echte ronde gaten en filtert countersinks / oppervlakkige cirkels weg.
+    Detects real through-holes and filters out countersinks or surface circles.
+    Returns clean hole list with X, Y, Z, diameter.
     """
     holes = []
     try:
         circle_faces = []
 
-        # Verzamel cirkels uit alle vlakken
+        # 1️⃣ Verzamel alle cirkels
         for face in shape.Faces():
             for edge in face.Edges():
                 if edge.geomType() == "CIRCLE":
                     circ = edge._geomAdaptor().Circle()
                     loc = circ.Location()
-                    center = (round(loc.X(), 3), round(loc.Y(), 3), round(loc.Z(), 3))
+                    center = (
+                        round(loc.X(), 3),
+                        round(loc.Y(), 3),
+                        round(loc.Z(), 3),
+                    )
                     radius = round(circ.Radius(), 3)
                     circle_faces.append({"center": center, "radius": radius})
 
-        # Combineer cirkels die vrijwel op dezelfde XY zitten
-        combined = []
+        # 2️⃣ Combineer cirkels die op zelfde XY zitten
+        merged = []
         for circ in circle_faces:
             diameter = circ["radius"] * 2
             if not (2.0 <= diameter <= 15.0):
                 continue
 
             cx, cy, cz = circ["center"]
+            # Zoek een match in XY
             match = next(
-                (m for m in combined if abs(m["x"] - cx) < 0.5 and abs(m["y"] - cy) < 0.5),
+                (
+                    m
+                    for m in merged
+                    if abs(m["x"] - cx) < 0.5
+                    and abs(m["y"] - cy) < 0.5
+                ),
                 None,
             )
 
             if match:
-                # Combineer boven/onderzijde → echte doorlopers
                 z_diff = abs(match["z"] - cz)
                 d_diff = abs(match["diameter"] - diameter)
+
+                # ⛔ Countersink: grotere cirkel vlakbij kleinere → negeer
+                if d_diff > 0.5 and z_diff < 2.0:
+                    continue
+
+                # ✅ Echte doorboring: combineer boven/onder
                 if z_diff > 1.0 and d_diff < 1.0:
                     match["z"] = round((match["z"] + cz) / 2, 3)
-                # ⚙️ countersinks (grotere diameter, dicht bij Z) → negeren
-                elif d_diff > 0.5 and z_diff < 1.0:
-                    continue
             else:
-                combined.append({
-                    "x": cx,
-                    "y": cy,
-                    "z": cz,
-                    "diameter": round(diameter, 3)
-                })
+                merged.append(
+                    {"x": cx, "y": cy, "z": cz, "diameter": round(diameter, 3)}
+                )
 
-        holes = combined
-        print(f"🕳️ Detected {len(holes)} refined holes")
+        holes = merged
+        print(f"🕳️ Detected {len(holes)} filtered through-holes")
 
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
