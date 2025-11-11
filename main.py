@@ -62,7 +62,11 @@ def detect_analytic_holes(shape):
                         loc = circ.Location()
                         center = (loc.X(), loc.Y(), loc.Z())
                         radius = circ.Radius()
-                        normal = face.normalAt(0.5, 0.5).toTuple()
+                        try:
+                            # ✅ use center normal if available
+                            normal = tuple(face.normalAt().toTuple())
+                        except Exception:
+                            normal = (0, 0, 1)
                         circle_faces.append({
                             "center": center,
                             "radius": radius,
