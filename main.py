@@ -4,19 +4,19 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import cadquery as cq
 import tempfile
 import os
+import math
 import traceback
 from supabase import create_client, Client
 import httpx
-import math
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # eventueel beperken tot Lovable domeinen
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,103 +43,115 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
-
 # -------------------------------
-# 🧩 Binnencontour detectie
+# 🕳️ Strikte Gatdetectie (range 1–1000 mm)
 # -------------------------------
-def detect_inner_contours(shape):
+def detect_analytic_holes_strict(shape,
+                                 d_min=1.0, d_max=1000.0,
+                                 xy_tol=0.2, d_tol=0.2,
+                                 z_pair_min=1.0, z_pair_max=40.0,
+                                 full_circle_tol_ratio=0.02):
     """
-    Detecteert ALLE binnencontouren (rond, sleuf, vierkant, complex)
-    en negeert buitencontouren of randafrondingen.
+    Detecteert echte doorlopende ronde gaten en filtert:
+    - boogsegmenten (géén volledige 360°)
+    - countersinks / ruimingen
+    - losse cirkels zonder tegenhanger
+    Retourneert lijst met {x,y,z,diameter} (z = gemiddelde van boven/onder).
     """
-    contours = []
-    contour_id = 0
 
-    try:
-        bbox = shape.BoundingBox()
-        max_dim = max(bbox.xlen, bbox.ylen, bbox.zlen)
-
-        for face_id, face in enumerate(shape.Faces()):
-            wires = face.Wires()
-            if len(wires) <= 1:
-                continue  # geen binnencontouren
-
-            outer_wire = wires[0]
-            inner_wires = wires[1:]
-
-            for wire in inner_wires:
-                contour_id += 1
-                points = []
-                for edge in wire.Edges():
-                    for vertex in edge.Vertices():
-                        v = vertex.toTuple()
-                        points.append([
-                            round(float(v[0]), 3),
-                            round(float(v[1]), 3),
-                            round(float(v[2]), 3)
-                        ])
-
-                # Sla contouren over die maar 1 of 2 punten hebben
-                if len(points) < 3:
+    circles = []
+    for face in shape.Faces():
+        for edge in face.Edges():
+            if edge.geomType() != "CIRCLE":
+                continue
+            try:
+                circ = edge._geomAdaptor().Circle()
+                loc = circ.Location()
+                r = float(circ.Radius())
+                if r <= 0:
                     continue
 
-                # Gemiddelde positie = centrum
-                cx = sum(p[0] for p in points) / len(points)
-                cy = sum(p[1] for p in points) / len(points)
-                cz = sum(p[2] for p in points) / len(points)
+                # check volledige cirkel: lengte ≈ 2πr
+                L = float(edge.Length())
+                if L <= 0:
+                    continue
+                full_L = 2.0 * math.pi * r
+                if abs(L - full_L) > full_circle_tol_ratio * full_L:
+                    continue  # hoogstwaarschijnlijk een boogdeel → overslaan
 
-                # Grootte (schatting)
-                dx = max(p[0] for p in points) - min(p[0] for p in points)
-                dy = max(p[1] for p in points) - min(p[1] for p in points)
-                dz = max(p[2] for p in points) - min(p[2] for p in points)
-                diag = (dx**2 + dy**2 + dz**2) ** 0.5
+                cx, cy, cz = float(loc.X()), float(loc.Y()), float(loc.Z())
+                d = 2.0 * r
 
-                # Alleen contouren die klein genoeg zijn (max 50% van grootste dimensie)
-                if diag > (max_dim * 0.5):
+                if not (d_min <= d <= d_max):
                     continue
 
-                # Vormclassificatie
-                edge_types = [e.geomType() for e in wire.Edges()]
-                if all(t == "CIRCLE" for t in edge_types):
-                    contour_type = "round"
-                elif any(t == "ELLIPSE" for t in edge_types):
-                    contour_type = "oval"
-                elif edge_types.count("LINE") >= 4:
-                    contour_type = "rectangular"
-                else:
-                    contour_type = "complex"
+                circles.append((round(cx, 3), round(cy, 3), round(cz, 3), round(d, 3)))
+            except Exception:
+                continue
 
-                contours.append({
-                    "id": contour_id,
-                    "face_id": face_id,
-                    "type": contour_type,
-                    "center": [round(cx, 3), round(cy, 3), round(cz, 3)],
-                    "points": points,
-                    "edgeCount": len(wire.Edges()),
-                    "size_estimate": round(diag, 3)
-                })
+    if not circles:
+        print("🕳️ No full-circle edges found.")
+        return []
 
-        print(f"🧩 Detected {len(contours)} filtered inner contours.")
-    except Exception as e:
-        print("⚠️ Inner contour detection failed:", e)
+    # Groepeer op XY & diameter
+    groups = []
+    for cx, cy, cz, d in circles:
+        placed = False
+        for g in groups:
+            if (abs(g["x"] - cx) <= xy_tol and
+                abs(g["y"] - cy) <= xy_tol and
+                abs(g["d"] - d) <= d_tol):
+                g["zs"].append(cz)
+                placed = True
+                break
+        if not placed:
+            groups.append({"x": cx, "y": cy, "d": d, "zs": [cz]})
 
-    return contours
+    # Zoek echte paren (boven/onderzijde)
+    holes = []
+    for g in groups:
+        zs = sorted(g["zs"])
+        if len(zs) < 2:
+            continue
+        found = False
+        for i in range(len(zs)):
+            for j in range(i + 1, len(zs)):
+                dz = abs(zs[j] - zs[i])
+                if z_pair_min <= dz <= z_pair_max:
+                    z_avg = round((zs[i] + zs[j]) / 2.0, 3)
+                    holes.append({
+                        "x": round(g["x"], 3),
+                        "y": round(g["y"], 3),
+                        "z": z_avg,
+                        "diameter": round(g["d"], 3)
+                    })
+                    found = True
+                    break
+            if found:
+                break
 
+    # Duplicaten verwijderen
+    deduped = []
+    for h in holes:
+        if not any(abs(h["x"] - u["x"]) <= xy_tol and
+                   abs(h["y"] - u["y"]) <= xy_tol and
+                   abs(h["diameter"] - u["diameter"]) <= d_tol for u in deduped):
+            deduped.append(h)
+
+    print(f"🕳️ Detected {len(deduped)} clean through-holes (strict).")
+    return deduped
 
 # -------------------------------
 # 📦 Upload helper
 # -------------------------------
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
-    """Upload bestand naar Supabase Storage en geef publieke URL terug."""
     if not supabase:
         raise RuntimeError("Supabase client not initialized.")
-
     bucket = "cad-models"
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
-
     try:
-        # Verwijder oude versie als die al bestaat
+        # verwijder oud bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
@@ -149,7 +161,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
                     storage.remove([f"analyzed/{remote_name}"])
                     break
         except Exception as e:
-            print("ℹ️ Geen bestaande bestanden gevonden of kon niet lezen:", e)
+            print("ℹ️ Geen bestaande bestanden gevonden:", e)
 
         with open(local_path, "rb") as f:
             res = storage.upload(remote_path, f)
@@ -158,23 +170,19 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
         public_url = storage.get_public_url(remote_path)
         print("🌍 Public URL:", public_url)
         return public_url
-
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
-
 
 # -------------------------------
 # 🔍 Basis endpoints
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (inner contour detection + Supabase)"}
-
+    return {"message": "STEP analyzer live ✅ (v1.7.1 strict holes + STL export)"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 # -------------------------------
 # 🧮 Analyzer endpoint
@@ -193,17 +201,16 @@ async def analyze_step(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Inladen in CadQuery
+        # STEP importeren
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
+        print(f"🧠 Analyzing: {file.filename}")
 
         # Bounding box
         bbox = shape.BoundingBox()
-        dims = {
-            "X": round(float(bbox.xlen), 3),
-            "Y": round(float(bbox.ylen), 3),
-            "Z": round(float(bbox.zlen), 3),
-        }
+        raw_dims = {"x": round(bbox.xlen, 3), "y": round(bbox.ylen, 3), "z": round(bbox.zlen, 3)}
+        sorted_dims = sorted(raw_dims.values(), reverse=True)
+        dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
         # Volume
         try:
@@ -211,47 +218,47 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # Binnencontouren detecteren
-        inner_contours = detect_inner_contours(shape)
+        # Hole detection
+        holes = detect_analytic_holes_strict(shape)
+        holes_detected = len(holes)
 
         # STL exporteren
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # Uploaden naar Supabase
+        # Upload naar Supabase
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # Opslaan in database
+        # Opslaan in Supabase database
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "dimensions": dims,
-                "inner_contours": inner_contours,
+                "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
+                "holes_detected": holes_detected,
+                "holes_data": holes,
+                "created_at": "now()",
                 "units": "mm",
                 "bounding_box_x": dims["X"],
                 "bounding_box_y": dims["Y"],
                 "bounding_box_z": dims["Z"],
-                "volume_mm3": volume_mm3,
                 "model_url": stl_public_url,
-                "created_at": "now()",
             }).execute()
 
+        # Resultaat terugsturen
         return JSONResponse(content={
             "status": "success",
             "units": "mm",
             "boundingBoxMM": dims,
             "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
             "filename": file.filename,
-            "innerContours": inner_contours,
+            "holesDetected": holes_detected,
+            "holes": holes,
             "modelURL": stl_public_url,
         })
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(status_code=500, content={
-            "error": f"Analysis failed: {str(e)}",
-            "trace": tb
-        })
+        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb})
     finally:
         for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
             try:
@@ -260,13 +267,11 @@ async def analyze_step(file: UploadFile = File(...)):
             except Exception:
                 pass
 
-
 # -------------------------------
-# 🌐 Proxy endpoint voor Lovable (CORS fix)
+# 🌐 Proxy voor CORS
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
-    """Proxy voor Lovable 3D viewer zodat CORS headers worden toegevoegd."""
     url = f"https://sywnjytfygvotskufvzs.supabase.co/storage/v1/object/public/{path}"
     try:
         async with httpx.AsyncClient() as client:
