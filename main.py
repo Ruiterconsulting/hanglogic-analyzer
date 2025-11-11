@@ -6,12 +6,13 @@ import tempfile
 import os
 import traceback
 import httpx
+import trimesh
 from supabase import create_client, Client
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,8 +27,8 @@ app.add_middleware(
 # -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client | None = None
 
+supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -42,35 +43,29 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
-
 # -------------------------------
-# 🕳️ Gatdetectie helper (CadQuery)
+# 🕳️ 1️⃣ CadQuery hole detection
 # -------------------------------
 def detect_cylindrical_holes(shape):
     """
-    Detecteert cilinders in het model (gesloten of doorlopende gaten).
-    Combineert boven- en onderzijden tot één gat.
-    Retourneert lijst met {x, y, z, diameter}.
+    Detecteert cilinders (ook gesloten gaten) in STEP via geometrische analyse.
     """
     holes = []
     try:
         cyl_faces = []
         for face in shape.Faces():
-            try:
-                if face.geomType() == "CYLINDER":
-                    surf = face.Surface()
-                    radius = float(surf.Radius())
-                    loc = surf.Location().toTuple()[0][:3]
-                    cyl_faces.append({
-                        "x": round(loc[0], 3),
-                        "y": round(loc[1], 3),
-                        "z": round(loc[2], 3),
-                        "radius": round(radius, 3)
-                    })
-            except Exception:
-                continue
+            if face.geomType() == "CYLINDER":
+                surf = face.Surface()
+                radius = float(surf.Radius())
+                loc = surf.Location().toTuple()[0][:3]
+                cyl_faces.append({
+                    "x": round(loc[0], 3),
+                    "y": round(loc[1], 3),
+                    "z": round(loc[2], 3),
+                    "radius": round(radius, 3)
+                })
 
-        # Combineer cilinders met dezelfde XY (boven/onder)
+        # Combineer boven/onder cilinders met zelfde XY
         used = set()
         for i, f1 in enumerate(cyl_faces):
             if i in used:
@@ -78,22 +73,19 @@ def detect_cylindrical_holes(shape):
             for j, f2 in enumerate(cyl_faces):
                 if i >= j or j in used:
                     continue
-                dx = abs(f1["x"] - f2["x"])
-                dy = abs(f1["y"] - f2["y"])
-                dr = abs(f1["radius"] - f2["radius"])
-                if dx < 0.5 and dy < 0.5 and dr < 0.2:
+                if abs(f1["x"] - f2["x"]) < 0.5 and abs(f1["y"] - f2["y"]) < 0.5 and abs(f1["radius"] - f2["radius"]) < 0.2:
                     z_mid = (f1["z"] + f2["z"]) / 2
                     holes.append({
                         "x": f1["x"],
                         "y": f1["y"],
-                        "z": round(z_mid, 3),
+                        "z": z_mid,
                         "diameter": round(f1["radius"] * 2, 3)
                     })
                     used.add(i)
                     used.add(j)
                     break
 
-        # Voeg losse cilinders toe (bijv. blinde gaten)
+        # Losse blinde gaten
         for i, f in enumerate(cyl_faces):
             if i not in used:
                 holes.append({
@@ -103,9 +95,44 @@ def detect_cylindrical_holes(shape):
                     "diameter": round(f["radius"] * 2, 3)
                 })
 
-        print(f"🕳️ Detected {len(holes)} cylindrical holes")
+        print(f"🧩 CadQuery found {len(holes)} cylindrical holes")
     except Exception as e:
-        print("⚠️ Hole detection failed:", e)
+        print("⚠️ CadQuery hole detection failed:", e)
+    return holes
+
+
+# -------------------------------
+# 🕳️ 2️⃣ Trimesh fallback hole detection
+# -------------------------------
+def detect_trimesh_holes(stl_path):
+    """
+    Detecteert openingen in de mesh (doorlopende gaten).
+    """
+    holes = []
+    try:
+        mesh = trimesh.load_mesh(stl_path)
+        loops = mesh.boundary_edges
+        if len(loops) == 0:
+            print("⚠️ No open boundaries found in STL.")
+            return holes
+
+        for loop in loops:
+            pts = mesh.vertices[list(loop)]
+            if len(pts) < 5:
+                continue
+            center = pts.mean(axis=0)
+            dists = ((pts - center) ** 2).sum(axis=1) ** 0.5
+            diameter = 2 * dists.mean()
+            holes.append({
+                "x": round(float(center[0]), 3),
+                "y": round(float(center[1]), 3),
+                "z": round(float(center[2]), 3),
+                "diameter": round(float(diameter), 3)
+            })
+
+        print(f"🧩 Trimesh found {len(holes)} open mesh holes")
+    except Exception as e:
+        print("⚠️ Trimesh detection failed:", e)
     return holes
 
 
@@ -119,51 +146,22 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
-        # Verwijder oud bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
                 name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
                 if name == remote_name:
-                    print(f"⚠️ Bestand {remote_name} bestaat al — verwijderen...")
                     storage.remove([f"analyzed/{remote_name}"])
                     break
-        except Exception as e:
-            print("ℹ️ Geen bestaande bestanden gevonden:", e)
+        except Exception:
+            pass
 
         with open(local_path, "rb") as f:
-            res = storage.upload(remote_path, f)
-        print("✅ Upload gelukt:", res)
+            storage.upload(remote_path, f)
 
-        public_url = storage.get_public_url(remote_path)
-        print("🌍 Public URL:", public_url)
-        return public_url
+        return storage.get_public_url(remote_path)
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
-
-
-# -------------------------------
-# 🔍 Basis endpoints
-# -------------------------------
-@app.get("/")
-def root():
-    return {"message": "STEP analyzer live ✅ (CadQuery + Cylindrical holes + Supabase)"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# -------------------------------
-# 🧰 Hulpfunctie
-# -------------------------------
-def _ensure_step_extension(filename: str):
-    ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".step", ".stp"]:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
-        )
 
 
 # -------------------------------
@@ -173,7 +171,9 @@ def _ensure_step_extension(filename: str):
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
     try:
-        _ensure_step_extension(file.filename)
+        if not file.filename.lower().endswith((".step", ".stp")):
+            raise HTTPException(status_code=415, detail="Only .STEP/.STP allowed")
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
@@ -181,19 +181,13 @@ async def analyze_step(file: UploadFile = File(...)):
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
 
-        print("🧠 Analyzing file:", file.filename)
-
-        # Bounding box
         bbox = shape.BoundingBox()
-        raw_dims = {
-            "x": round(float(bbox.xlen), 3),
-            "y": round(float(bbox.ylen), 3),
-            "z": round(float(bbox.zlen), 3),
+        dims = {
+            "X": round(float(bbox.xlen), 3),
+            "Y": round(float(bbox.ylen), 3),
+            "Z": round(float(bbox.zlen), 3)
         }
-        sorted_dims = sorted(raw_dims.values(), reverse=True)
-        dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
 
-        # Volume
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
@@ -203,18 +197,18 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # Hole detection (via CadQuery)
+        # Hole detection (hybrid)
         holes = detect_cylindrical_holes(shape)
-        holes_detected = len(holes)
+        if len(holes) == 0:
+            holes = detect_trimesh_holes(stl_path)
 
-        # Upload STL
+        holes_detected = len(holes)
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # Opslaan in Supabase
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
+                "dimensions": dims,
                 "holes_detected": holes_detected,
                 "holes_data": holes,
                 "units": "mm",
@@ -230,7 +224,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "status": "success",
                 "units": "mm",
                 "boundingBoxMM": dims,
-                "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
+                "volumeMM3": volume_mm3,
                 "filename": file.filename,
                 "holesDetected": holes_detected,
                 "holes": holes,
@@ -240,7 +234,7 @@ async def analyze_step(file: UploadFile = File(...)):
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {str(e)}", "trace": tb})
+        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb})
     finally:
         for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
             try:
@@ -251,14 +245,10 @@ async def analyze_step(file: UploadFile = File(...)):
 
 
 # -------------------------------
-# 🌐 Proxy endpoint (CORS-fix)
+# 🌐 Proxy endpoint (CORS)
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
-    """
-    Haalt STL-bestand op van Supabase Storage en voegt juiste CORS headers toe.
-    Hierdoor kan Lovable het model rechtstreeks renderen.
-    """
     url = f"https://sywnjytfygvotskufvzs.supabase.co/storage/v1/object/public/{path}"
     try:
         async with httpx.AsyncClient() as client:
@@ -272,5 +262,4 @@ async def proxy_file(path: str):
         }
         return StreamingResponse(iter([r.content]), headers=headers)
     except Exception as e:
-        print("⚠️ Proxy fetch failed:", e)
-        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {str(e)}"})
+        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {e}"})
