@@ -47,65 +47,52 @@ else:
 # -------------------------------
 def detect_analytic_holes(shape):
     """
-    Detect holes by analyzing circular faces and aligned axes.
-    Works for both through and blind holes.
+    Detecteert ronde gaten en combineert dubbele detecties.
+    Filtert op diameter en positie.
     """
     holes = []
     try:
         circle_faces = []
+
+        # Verzamel alle cirkels
         for face in shape.Faces():
-            geom_type = face.geomType()
-            if geom_type in ["CYLINDER", "PLANE"]:
-                for edge in face.Edges():
-                    if edge.geomType() == "CIRCLE":
-                        circ = edge._geomAdaptor().Circle()
-                        loc = circ.Location()
-                        center = (loc.X(), loc.Y(), loc.Z())
-                        radius = circ.Radius()
-                        try:
-                            # ✅ use center normal if available
-                            normal = tuple(face.normalAt().toTuple())
-                        except Exception:
-                            normal = (0, 0, 1)
-                        circle_faces.append({
-                            "center": center,
-                            "radius": radius,
-                            "normal": normal
-                        })
+            for edge in face.Edges():
+                if edge.geomType() == "CIRCLE":
+                    circ = edge._geomAdaptor().Circle()
+                    loc = circ.Location()
+                    center = (round(loc.X(), 3), round(loc.Y(), 3), round(loc.Z(), 3))
+                    radius = round(circ.Radius(), 3)
+                    circle_faces.append({"center": center, "radius": radius})
 
-        used = set()
-        for i, f1 in enumerate(circle_faces):
-            if i in used:
+        # Combineer cirkels die vrijwel op dezelfde plek zitten
+        merged = []
+        for circ in circle_faces:
+            # Diameter berekenen
+            diameter = circ["radius"] * 2
+
+            # 🔹 Filter op realistische gaten (bijv. tussen 2 en 15 mm)
+            if not (2.0 <= diameter <= 15.0):
                 continue
-            for j, f2 in enumerate(circle_faces):
-                if i >= j or j in used:
-                    continue
-                dx = abs(f1["center"][0] - f2["center"][0])
-                dy = abs(f1["center"][1] - f2["center"][1])
-                dr = abs(f1["radius"] - f2["radius"])
-                if dx < 0.5 and dy < 0.5 and dr < 0.2:
-                    z_mid = (f1["center"][2] + f2["center"][2]) / 2
-                    holes.append({
-                        "x": round(f1["center"][0], 3),
-                        "y": round(f1["center"][1], 3),
-                        "z": round(z_mid, 3),
-                        "diameter": round(f1["radius"] * 2, 3)
-                    })
-                    used.add(i)
-                    used.add(j)
-                    break
 
-        # Als een cirkel geen tegenhanger heeft → blind hole
-        for i, f in enumerate(circle_faces):
-            if i not in used:
-                holes.append({
-                    "x": round(f["center"][0], 3),
-                    "y": round(f["center"][1], 3),
-                    "z": round(f["center"][2], 3),
-                    "diameter": round(f["radius"] * 2, 3)
+            cx, cy, cz = circ["center"]
+            match = next(
+                (m for m in merged if abs(m["x"] - cx) < 0.5 and abs(m["y"] - cy) < 0.5 and abs(m["diameter"] - diameter) < 0.5),
+                None,
+            )
+            if match:
+                # Combineer (gemiddelde z)
+                match["z"] = round((match["z"] + cz) / 2, 3)
+            else:
+                merged.append({
+                    "x": cx,
+                    "y": cy,
+                    "z": cz,
+                    "diameter": round(diameter, 3)
                 })
 
-        print(f"🕳️ Detected {len(holes)} holes (analytic method)")
+        holes = merged
+        print(f"🕳️ Detected {len(holes)} unique filtered holes")
+
     except Exception as e:
         print("⚠️ Hole detection failed:", e)
     return holes
