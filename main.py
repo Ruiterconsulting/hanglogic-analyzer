@@ -54,13 +54,13 @@ def detect_analytic_holes(shape):
     try:
         circle_faces = []
         for face in shape.Faces():
-            # Zoek naar cilindrische of vlakke cirkelvormige vlakken
             geom_type = face.geomType()
             if geom_type in ["CYLINDER", "PLANE"]:
                 for edge in face.Edges():
                     if edge.geomType() == "CIRCLE":
                         circ = edge._geomAdaptor().Circle()
-                        center = circ.Location().toTuple()[0][:3]
+                        loc = circ.Location()
+                        center = (loc.X(), loc.Y(), loc.Z())
                         radius = circ.Radius()
                         normal = face.normalAt(0.5, 0.5).toTuple()
                         circle_faces.append({
@@ -69,7 +69,6 @@ def detect_analytic_holes(shape):
                             "normal": normal
                         })
 
-        # Combineer cirkels met dezelfde XY en radius → doorlopend gat
         used = set()
         for i, f1 in enumerate(circle_faces):
             if i in used:
@@ -92,7 +91,7 @@ def detect_analytic_holes(shape):
                     used.add(j)
                     break
 
-        # Blinde gaten die geen tegenvlak hebben
+        # Als een cirkel geen tegenhanger heeft → blind hole
         for i, f in enumerate(circle_faces):
             if i not in used:
                 holes.append({
