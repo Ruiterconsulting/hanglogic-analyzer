@@ -6,13 +6,12 @@ import tempfile
 import os
 import traceback
 import httpx
-import trimesh
 from supabase import create_client, Client
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.9.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,97 +43,69 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🕳️ 1️⃣ CadQuery hole detection
+# 🕳️ Hole detection via CadQuery faces
 # -------------------------------
-def detect_cylindrical_holes(shape):
+def detect_analytic_holes(shape):
     """
-    Detecteert cilinders (ook gesloten gaten) in STEP via geometrische analyse.
+    Detect holes by analyzing circular faces and aligned axes.
+    Works for both through and blind holes.
     """
     holes = []
     try:
-        cyl_faces = []
+        circle_faces = []
         for face in shape.Faces():
-            if face.geomType() == "CYLINDER":
-                surf = face.Surface()
-                radius = float(surf.Radius())
-                loc = surf.Location().toTuple()[0][:3]
-                cyl_faces.append({
-                    "x": round(loc[0], 3),
-                    "y": round(loc[1], 3),
-                    "z": round(loc[2], 3),
-                    "radius": round(radius, 3)
-                })
+            # Zoek naar cilindrische of vlakke cirkelvormige vlakken
+            geom_type = face.geomType()
+            if geom_type in ["CYLINDER", "PLANE"]:
+                for edge in face.Edges():
+                    if edge.geomType() == "CIRCLE":
+                        circ = edge._geomAdaptor().Circle()
+                        center = circ.Location().toTuple()[0][:3]
+                        radius = circ.Radius()
+                        normal = face.normalAt(0.5, 0.5).toTuple()
+                        circle_faces.append({
+                            "center": center,
+                            "radius": radius,
+                            "normal": normal
+                        })
 
-        # Combineer boven/onder cilinders met zelfde XY
+        # Combineer cirkels met dezelfde XY en radius → doorlopend gat
         used = set()
-        for i, f1 in enumerate(cyl_faces):
+        for i, f1 in enumerate(circle_faces):
             if i in used:
                 continue
-            for j, f2 in enumerate(cyl_faces):
+            for j, f2 in enumerate(circle_faces):
                 if i >= j or j in used:
                     continue
-                if abs(f1["x"] - f2["x"]) < 0.5 and abs(f1["y"] - f2["y"]) < 0.5 and abs(f1["radius"] - f2["radius"]) < 0.2:
-                    z_mid = (f1["z"] + f2["z"]) / 2
+                dx = abs(f1["center"][0] - f2["center"][0])
+                dy = abs(f1["center"][1] - f2["center"][1])
+                dr = abs(f1["radius"] - f2["radius"])
+                if dx < 0.5 and dy < 0.5 and dr < 0.2:
+                    z_mid = (f1["center"][2] + f2["center"][2]) / 2
                     holes.append({
-                        "x": f1["x"],
-                        "y": f1["y"],
-                        "z": z_mid,
+                        "x": round(f1["center"][0], 3),
+                        "y": round(f1["center"][1], 3),
+                        "z": round(z_mid, 3),
                         "diameter": round(f1["radius"] * 2, 3)
                     })
                     used.add(i)
                     used.add(j)
                     break
 
-        # Losse blinde gaten
-        for i, f in enumerate(cyl_faces):
+        # Blinde gaten die geen tegenvlak hebben
+        for i, f in enumerate(circle_faces):
             if i not in used:
                 holes.append({
-                    "x": f["x"],
-                    "y": f["y"],
-                    "z": f["z"],
+                    "x": round(f["center"][0], 3),
+                    "y": round(f["center"][1], 3),
+                    "z": round(f["center"][2], 3),
                     "diameter": round(f["radius"] * 2, 3)
                 })
 
-        print(f"🧩 CadQuery found {len(holes)} cylindrical holes")
+        print(f"🕳️ Detected {len(holes)} holes (analytic method)")
     except Exception as e:
-        print("⚠️ CadQuery hole detection failed:", e)
+        print("⚠️ Hole detection failed:", e)
     return holes
-
-
-# -------------------------------
-# 🕳️ 2️⃣ Trimesh fallback hole detection
-# -------------------------------
-def detect_trimesh_holes(stl_path):
-    """
-    Detecteert openingen in de mesh (doorlopende gaten).
-    """
-    holes = []
-    try:
-        mesh = trimesh.load_mesh(stl_path)
-        loops = mesh.boundary_edges
-        if len(loops) == 0:
-            print("⚠️ No open boundaries found in STL.")
-            return holes
-
-        for loop in loops:
-            pts = mesh.vertices[list(loop)]
-            if len(pts) < 5:
-                continue
-            center = pts.mean(axis=0)
-            dists = ((pts - center) ** 2).sum(axis=1) ** 0.5
-            diameter = 2 * dists.mean()
-            holes.append({
-                "x": round(float(center[0]), 3),
-                "y": round(float(center[1]), 3),
-                "z": round(float(center[2]), 3),
-                "diameter": round(float(diameter), 3)
-            })
-
-        print(f"🧩 Trimesh found {len(holes)} open mesh holes")
-    except Exception as e:
-        print("⚠️ Trimesh detection failed:", e)
-    return holes
-
 
 # -------------------------------
 # 📦 Upload helper
@@ -146,6 +117,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
+        # Verwijder eventueel bestaand bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
@@ -163,7 +135,6 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
 
-
 # -------------------------------
 # 🧮 Analyzer endpoint
 # -------------------------------
@@ -174,10 +145,12 @@ async def analyze_step(file: UploadFile = File(...)):
         if not file.filename.lower().endswith((".step", ".stp")):
             raise HTTPException(status_code=415, detail="Only .STEP/.STP allowed")
 
+        # Tijdelijk opslaan
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        # Inladen en analyseren
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
 
@@ -193,18 +166,16 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # Export STL
+        # Hole detection
+        holes = detect_analytic_holes(shape)
+        holes_detected = len(holes)
+
+        # STL export
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
-
-        # Hole detection (hybrid)
-        holes = detect_cylindrical_holes(shape)
-        if len(holes) == 0:
-            holes = detect_trimesh_holes(stl_path)
-
-        holes_detected = len(holes)
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
+        # Supabase DB insert
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -242,7 +213,6 @@ async def analyze_step(file: UploadFile = File(...)):
                     os.remove(path)
             except Exception:
                 pass
-
 
 # -------------------------------
 # 🌐 Proxy endpoint (CORS)
