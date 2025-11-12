@@ -80,11 +80,22 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
 
-    with open(local_path, "rb") as f:
-        res = storage.upload(remote_path, f)
-    print("✅ Upload:", remote_name)
-    public_url = storage.get_public_url(remote_path)
-    return public_url
+    try:
+        # verwijder oud bestand indien aanwezig
+        try:
+            storage.remove([remote_path])
+        except Exception as e:
+            print("ℹ️ No previous file to remove:", e)
+
+        # upload nieuwe file
+        with open(local_path, "rb") as f:
+            res = storage.upload(remote_path, f)
+        print("✅ Upload:", remote_name)
+
+        public_url = storage.get_public_url(remote_path)
+        return public_url
+    except Exception as e:
+        raise RuntimeError(f"Upload to Supabase failed: {e}")
 
 # -------------------------------
 # 🧮 Analyzer endpoint
