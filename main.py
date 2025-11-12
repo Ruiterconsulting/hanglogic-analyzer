@@ -88,9 +88,8 @@ def _wire_center_approx(wire: cq.Wire):
 def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8):
     """
     Voor elk vlak pakt dit de inner wires (binnencontouren) en
-    maakt een dun groen 'patchje' door een vaste dikte
-    langs de vlak-normaal te extruderen. Zo krijg je
-    een duidelijk zichtbaar groen 'vulling' op gaten/uitsparingen.
+    maakt een dun groen 'patchje' door de contour te extruderen.
+    Werkt ook bij non-planar of niet-perfecte wires.
     """
     green_solids = []
     total_wires = 0
@@ -99,11 +98,9 @@ def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8
     for face in shape.Faces():
         wires = face.Wires()
         if len(wires) <= 1:
-            continue  # geen binnencontouren op dit face
-        # wires[0] is meestal outer; de rest inner
+            continue
         inner = wires[1:]
         total_wires += len(inner)
-
         n = _face_normal(face)
         if n.Length == 0:
             continue
@@ -111,14 +108,27 @@ def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8
 
         for w in inner:
             try:
-                cx, cy, cz = _wire_center_approx(w)
-                # maak dunne disc/patch op het vlak: extrude vanuit de wire zelf
-                # CQ kan een wire extruderen tot een Solid via makeFace → extrude
+                # probeer normale face-build
                 patch_face = cq.Face.makeFromWires(w)
                 patch_solid = patch_face.extrude(n * thickness)
                 green_solids.append(patch_solid)
-            except Exception as e:
-                failed += 1
+            except Exception:
+                try:
+                    # fallback: maak cirkelpatch via gemiddelde center + radius
+                    pts = [v.toTuple() for v in w.Vertices()]
+                    if len(pts) >= 3:
+                        cx = sum(p[0] for p in pts) / len(pts)
+                        cy = sum(p[1] for p in pts) / len(pts)
+                        cz = sum(p[2] for p in pts) / len(pts)
+                        # schatting radius
+                        r = sum(math.dist(p, (cx, cy, cz)) for p in pts) / len(pts)
+                        patch = cq.Workplane("XY").moveTo(cx, cy).circle(r).extrude(thickness)
+                        green_solids.append(patch.val())
+                    else:
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                    continue
 
     print(f"✅ Found {total_wires} inner wires; built {len(green_solids)} green patches; failed {failed}")
     if not green_solids:
