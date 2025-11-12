@@ -10,7 +10,7 @@ from supabase import create_client, Client
 import httpx
 
 
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.7")
+app = FastAPI(title="HangLogic Analyzer API", version="2.2.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,9 +20,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------
+
+# ------------------------------
 # Supabase connect
-# --------------------------
+# ------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -31,25 +32,24 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("✅ Connected to Supabase")
 else:
-    print("⚠️ Supabase env vars missing")
+    print("⚠️ Missing Supabase credentials")
 
 
-# --------------------------
+# ------------------------------
 # Upload helper
-# --------------------------
+# ------------------------------
 def upload_new_file(local_path: str, remote_name: str) -> str:
     if not supabase:
-        raise RuntimeError("Supabase client not initialized")
+        raise RuntimeError("Supabase not initialized")
 
     bucket = "cad-models"
     storage = supabase.storage.from_(bucket)
 
-    # Maak naam altijd uniek
     base, ext = os.path.splitext(remote_name)
     unique_name = f"{base}_{os.urandom(4).hex()}{ext}"
-    remote_path = f"analyzed/{unique_name}"
 
-    print("📤 Uploading:", remote_path)
+    remote_path = f"analyzed/{unique_name}"
+    print("📤 Upload:", remote_path)
 
     with open(local_path, "rb") as f:
         storage.upload(remote_path, f)
@@ -57,49 +57,41 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
     return storage.get_public_url(remote_path)
 
 
-# --------------------------
-# Helper: detect inner contours
-# --------------------------
+# ------------------------------
+# Detect inner wires
+# ------------------------------
 def detect_inner_wires(shape):
-    """Return list of (face_index, face, inner_wire_list)."""
-
-    result = []
+    data = []
 
     for f_idx, face in enumerate(shape.Faces()):
         wires = list(face.Wires())
 
         if len(wires) <= 1:
-            continue  # no inner contours
+            continue
 
-        # eerste wire is altijd outer boundary
-        outer_wire = wires[0]
-        inner = wires[1:]
+        outer = wires[0]
+        inners = wires[1:]
 
-        result.append((f_idx, face, inner))
+        data.append((f_idx, face, inners))
 
-    return result
+    return data
 
 
-# --------------------------
-# Root test
-# --------------------------
+# ------------------------------
 @app.get("/")
 def root():
-    return {"status": "HangLogic API live", "version": "2.2.7"}
+    return {"status": "ok", "version": "2.2.8"}
 
 
-# --------------------------
-# Check extension
-# --------------------------
-def ensure_step(filename: str):
+def ensure_step(filename):
     ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".step", ".stp"]:
-        raise HTTPException(415, f"Invalid type '{ext}', upload .STEP/.STP only")
+    if ext not in [".stp", ".step"]:
+        raise HTTPException(415, "Upload only .STEP or .STP files")
 
 
-# --------------------------
-# ANALYZER
-# --------------------------
+# ------------------------------
+# MAIN ANALYZER
+# ------------------------------
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_step = tmp_stl = tmp_glb = None
@@ -107,7 +99,7 @@ async def analyze_step(file: UploadFile = File(...)):
     try:
         ensure_step(file.filename)
 
-        # write STEP to disk
+        # save STEP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
@@ -115,49 +107,43 @@ async def analyze_step(file: UploadFile = File(...)):
         model = cq.importers.importStep(tmp_step)
         shape = model.val()
 
-        print(f"🧠 Analyzing {file.filename}")
-
         bbox = shape.BoundingBox()
         dims = {
             "x": round(bbox.xlen, 3),
             "y": round(bbox.ylen, 3),
-            "z": round(bbox.zlen, 3),
+            "z": round(bbox.zlen, 3)
         }
 
-        plate_thickness = dims["z"]
+        thickness = dims["z"]
 
-        # detect holes / inner contours
         inner_data = detect_inner_wires(shape)
 
-        # generate fills
         filled_solids = []
 
-        for f_idx, face, wire_list in inner_data:
-            for w_idx, wire in enumerate(wire_list):
+        # -----------------------------
+        # Generate fills
+        # -----------------------------
+        for f_idx, face, wires in inner_data:
+            for w_idx, wire in enumerate(wires):
 
-                # 1) Skip null / invalid
+                # Skip invalid wires
                 try:
-                    if wire.isNull() or wire.Length() < 0.01:
-                        print(f"⚠️ Skipping invalid wire (face {f_idx}, wire {w_idx})")
+                    if wire.isNull() or wire.Length() < 0.5:
+                        print(f"⚠️ skipping null/short wire {w_idx}")
                         continue
                 except:
-                    print(f"⚠️ wire exception – skipping (face {f_idx})")
                     continue
 
-                # 2) Normaal pakken
                 try:
                     normal = face.normalAt()
                 except:
                     normal = cq.Vector(0, 0, 1)
 
-                # 3) Center pakken
                 try:
                     center = wire.Center()
                 except:
-                    # fallback op face-center
                     center = face.Center()
 
-                # 4) Workplane op het draadje
                 plane = cq.Plane(
                     (center.x, center.y, center.z),
                     (normal.x, normal.y, normal.z)
@@ -166,49 +152,51 @@ async def analyze_step(file: UploadFile = File(...)):
                 try:
                     wp = cq.Workplane(plane).add(wire)
 
-                    # 5) symmetrisch extruderen door volledige plaat
-                    pos = wp.toPending().extrude(plate_thickness / 2)
-                    neg = wp.toPending().extrude(-plate_thickness / 2)
+                    pos = wp.toPending().extrude(thickness / 2)
+                    neg = wp.toPending().extrude(-thickness / 2)
                     fill = pos.union(neg)
 
                     filled_solids.append(fill)
 
                 except Exception as e:
-                    print(f"⚠️ Fill failed on face {f_idx}, wire {w_idx}: {e}")
+                    print(f"⚠️ fill failed: face {f_idx}, wire {w_idx}: {e}")
 
-        # combine into colored export
+        # -----------------------------
+        # Build GLB assembly
+        # -----------------------------
         blue = (0.6, 0.8, 1.0)
         green = (0.0, 1.0, 0.0)
 
-        colored = cq.Compound.makeCompound([
-            shape.setColor(*blue)
-        ] + [s.setColor(*green) for s in filled_solids])
+        asm = cq.Assembly()
 
-        # export STL
+        asm.add(shape, name="base", color=blue)
+
+        for idx, solid in enumerate(filled_solids):
+            asm.add(solid, name=f"fill_{idx}", color=green)
+
+        tmp_glb = tmp_step.replace(".step", ".glb")
+        asm.save(tmp_glb, exportType="GLTF")
+
+        # STL export
         tmp_stl = tmp_step.replace(".step", ".stl")
         cq.exporters.export(shape, tmp_stl, "STL")
 
-        # export GLB
-        tmp_glb = tmp_step.replace(".step", ".glb")
-        cq.exporters.export(colored, tmp_glb, exportType="GLTF")  # GLB via GLTF
-
+        # Upload
         stl_url = upload_new_file(tmp_stl, file.filename.replace(".step", ".stl"))
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
-        # store in Supabase table
-        if supabase:
-            supabase.table("analyzed_parts").insert({
-                "filename": file.filename,
-                "dimensions": dims,
-                "bounding_box_x": dims["x"],
-                "bounding_box_y": dims["y"],
-                "bounding_box_z": dims["z"],
-                "holes_detected": len(inner_data),
-                "model_url": stl_url,
-                "model_url_glb": glb_url,
-                "units": "mm",
-                "created_at": "now()",
-            }).execute()
+        supabase.table("analyzed_parts").insert({
+            "filename": file.filename,
+            "dimensions": dims,
+            "bounding_box_x": dims["x"],
+            "bounding_box_y": dims["y"],
+            "bounding_box_z": dims["z"],
+            "holes_detected": len(inner_data),
+            "units": "mm",
+            "model_url": stl_url,
+            "model_url_glb": glb_url,
+            "created_at": "now()"
+        }).execute()
 
         return {
             "status": "success",
@@ -216,20 +204,19 @@ async def analyze_step(file: UploadFile = File(...)):
             "dimensions": dims,
             "filledContours": len(filled_solids),
             "modelURL": stl_url,
-            "modelURL_GLB": glb_url,
+            "modelURL_GLB": glb_url
         }
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"error": str(e), "trace": traceback.format_exc()},
+            content={"error": str(e), "trace": traceback.format_exc()}
         )
 
     finally:
-        # cleanup
-        for path in [tmp_step, tmp_stl, tmp_glb]:
+        for p in [tmp_step, tmp_stl, tmp_glb]:
             try:
-                if path and os.path.exists(path):
-                    os.remove(path)
+                if p and os.path.exists(p):
+                    os.remove(p)
             except:
                 pass
