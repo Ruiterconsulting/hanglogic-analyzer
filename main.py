@@ -4,13 +4,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import cadquery as cq
 import tempfile
 import os
-import math
 import traceback
 from supabase import create_client, Client
 import httpx
 import datetime
 
-app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,55 +24,38 @@ app.add_middleware(
 # -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Connected to Supabase.")
     except Exception as e:
-        print("⚠️ Could not initialize Supabase client:", e)
+        print("⚠️ Could not init Supabase:", e)
 else:
     print("⚠️ Missing SUPABASE credentials.")
 
 # -------------------------------
-# 🕳️ Hole Detection
-# -------------------------------
-def detect_holes(shape, d_min=1.0, d_max=1000.0):
-    holes = []
-    for face in shape.Faces():
-        for edge in face.Edges():
-            if edge.geomType() != "CIRCLE":
-                continue
-            circ = edge._geomAdaptor().Circle()
-            r = circ.Radius()
-            if d_min <= r * 2 <= d_max:
-                loc = circ.Location()
-                holes.append((float(loc.X()), float(loc.Y()), float(loc.Z()), float(r * 2)))
-    print(f"🕳️ Found {len(holes)} circular holes.")
-    return holes
-
-# -------------------------------
 # 🟦🟩 Model coloring
 # -------------------------------
-def colorize_shape(shape: cq.Shape):
+def colorize_shape(shape: cq.Shape) -> cq.Assembly:
     """
-    Maakt een samengestelde Assembly:
-      - Basismodel = blauw (#0A0F4B)
-      - Binnencontouren = groen (#09D34B)
+    Returneert een Assembly:
+      - blauw (#0A0F4B) voor het hoofddeel
+      - groen (#09D34B) voor binnencontouren
     """
     asm = cq.Assembly(name="colored_model")
-    asm.add(shape, color=cq.Color(0.039, 0.059, 0.294))  # blauw hoofddeel
+    # hoofddeel blauw
+    asm.add(shape, color=cq.Color(0.039, 0.059, 0.294))  
 
+    # binnencontouren groen
     try:
         for face in shape.Faces():
             for wire in face.Wires():
-                if len(wire.Edges()) >= 3 and not wire.isOuterWire():
-                    # Binnencontour
-                    hole_face = cq.Face.makeFromWires(wire)
-                    asm.add(hole_face, color=cq.Color(0.035, 0.827, 0.294))  # groen vlak
+                if not wire.isOuterWire():
+                    inner_face = cq.Face.makeFromWires(wire)
+                    asm.add(inner_face, color=cq.Color(0.035, 0.827, 0.294))
     except Exception as e:
-        print("⚠️ Colorize failed:", e)
+        print("⚠️ Colorization warning:", e)
 
     return asm
 
@@ -91,47 +73,50 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     storage = supabase.storage.from_(bucket)
     with open(local_path, "rb") as f:
         storage.upload(remote_path, f)
-    public_url = storage.get_public_url(remote_path)
-    print(f"🌍 Uploaded: {public_url}")
-    return public_url
+    url = storage.get_public_url(remote_path)
+    print(f"🌍 Uploaded: {url}")
+    return url
 
 # -------------------------------
-# 🧮 Analyzer endpoint
+# 🧮 Analyzer
 # -------------------------------
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
     try:
         if not file.filename.lower().endswith((".step", ".stp")):
-            raise HTTPException(status_code=415, detail="Unsupported file type")
+            raise HTTPException(status_code=415, detail="Upload .STEP only")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        shape = cq.importers.importStep(tmp_path).val()
         print(f"🧠 Analyzing: {file.filename}")
-        model = cq.importers.importStep(tmp_path)
-        shape = model.val()
 
         bbox = shape.BoundingBox()
-        dims = {"X": round(bbox.xlen, 3), "Y": round(bbox.ylen, 3), "Z": round(bbox.zlen, 3)}
+        dims = {
+            "X": round(bbox.xlen, 3),
+            "Y": round(bbox.ylen, 3),
+            "Z": round(bbox.zlen, 3)
+        }
         volume = round(shape.Volume(), 3)
-        holes = detect_holes(shape)
 
-        # 🟦 maak kleurmodel
-        colored = colorize_shape(shape)
+        # 🟦 maak gekleurde Assembly
+        asm = colorize_shape(shape)
+        assert isinstance(asm, cq.Assembly), "colorize_shape() must return Assembly"
 
-        # 📤 export STL
+        # Export STL (blauw/grijs model)
         stl_path = tmp_path.replace(".step", ".stl")
-        cq.exporters.export(shape, stl_path, "STL")
+        cq.exporters.export(shape, stl_path, exportType="STL")
         stl_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
 
-        # 📤 export GLB (met kleur)
+        # Export GLTF/GLB (met kleuren)
         glb_path = tmp_path.replace(".step", ".glb")
-        cq.exporters.export(colored, glb_path, exportType="GLTF")
+        cq.exporters.export(asm, glb_path, exportType="GLTF")
         glb_url = upload_to_supabase(glb_path, file.filename.replace(".step", ".glb"))
 
-        # 🧾 save + response
+        # Opslaan
         if supabase:
             try:
                 supabase.table("analyzed_parts").insert({
@@ -140,8 +125,6 @@ async def analyze_step(file: UploadFile = File(...)):
                     "bounding_box_y": dims["Y"],
                     "bounding_box_z": dims["Z"],
                     "volume_mm3": volume,
-                    "holes_detected": len(holes),
-                    "holes_data": holes,
                     "model_url_stl": stl_url,
                     "model_url_glb": glb_url,
                     "created_at": "now()",
@@ -151,11 +134,9 @@ async def analyze_step(file: UploadFile = File(...)):
 
         return JSONResponse(content={
             "status": "success",
-            "units": "mm",
+            "filename": file.filename,
             "boundingBoxMM": dims,
             "volumeMM3": volume,
-            "holesDetected": len(holes),
-            "holes": holes,
             "modelURL_stl": stl_url,
             "modelURL_glb": glb_url
         })
@@ -172,7 +153,7 @@ async def analyze_step(file: UploadFile = File(...)):
                     os.remove(p)
 
 # -------------------------------
-# 🌐 Proxy for CORS
+# 🌐 Proxy
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
