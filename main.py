@@ -9,11 +9,13 @@ import traceback
 from supabase import create_client, Client
 import httpx
 import trimesh
+import uuid
+from datetime import datetime
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.9.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +42,7 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🕳️ Oude strikte ronde gaten
+# 🕳️ Oude strikte ronde gaten (ter info)
 # -------------------------------
 def detect_analytic_holes_strict(shape,
                                  d_min=2.0, d_max=30.0,
@@ -68,7 +70,7 @@ def detect_analytic_holes_strict(shape,
                 d = 2.0 * r
                 if not (d_min <= d <= d_max):
                     continue
-                circles.append((round(cx, 3), round(cy, 3), round(cz, 3), round(d, 3)))
+                circles.append((cx, cy, cz, d))
             except Exception:
                 continue
 
@@ -94,26 +96,25 @@ def detect_analytic_holes_strict(shape,
         for i in range(len(zs) - 1):
             dz = abs(zs[i + 1] - zs[i])
             if z_pair_min <= dz <= z_pair_max:
-                z_avg = round((zs[i] + zs[i + 1]) / 2.0, 3)
+                z_avg = (zs[i] + zs[i + 1]) / 2.0
                 holes.append({
                     "x": round(g["x"], 3),
                     "y": round(g["y"], 3),
-                    "z": z_avg,
+                    "z": round(z_avg, 3),
                     "diameter": round(g["d"], 3),
                     "dz": round(dz, 3)
                 })
                 break
-
     print(f"🕳️ Detected {len(holes)} clean through-holes (strict).")
     return holes
 
 # -------------------------------
-# 🟢 Nieuwe algemene binnencontour-detectie
+# 🟢 Algemene binnencontour-detectie
 # -------------------------------
 def detect_all_inner_contours(shape):
     """
     Detecteert ALLE binnencontouren (rond, vierkant, sleuf, willekeurig)
-    Retourneert lijst met {x,y,z,diameter,dz} voor groene staven.
+    Retourneert lijst met {x,y,z,diameter,dz}.
     """
     holes = []
     for face in shape.Faces():
@@ -123,11 +124,8 @@ def detect_all_inner_contours(shape):
             outer = None
 
         for wire in face.Wires():
-            # skip de buitenste contour van het vlak
             if outer and wire.isSame(outer):
                 continue
-
-            # dit is dus een binnencontour
             bb = wire.BoundingBox()
             cx = (bb.xmin + bb.xmax) / 2
             cy = (bb.ymin + bb.ymax) / 2
@@ -145,18 +143,29 @@ def detect_all_inner_contours(shape):
     return holes
 
 # -------------------------------
-# 📦 Upload helper
+# 📦 Upload helper (no overwrite)
 # -------------------------------
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
+    """
+    Uploadt bestand naar Supabase met unieke naam (geen overschrijving).
+    """
     if not supabase:
         raise RuntimeError("Supabase client not initialized.")
+
     bucket = "cad-models"
-    remote_path = f"analyzed/{remote_name}"
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    name, ext = os.path.splitext(remote_name)
+    unique_name = f"{name}_{timestamp}_{unique_id}{ext}"
+    remote_path = f"analyzed/{unique_name}"
     storage = supabase.storage.from_(bucket)
+
     try:
         with open(local_path, "rb") as f:
             storage.upload(remote_path, f)
+
         public_url = storage.get_public_url(remote_path)
+        print(f"✅ Uploaded new file version: {unique_name}")
         return public_url
     except Exception as e:
         raise RuntimeError(f"Upload to Supabase failed: {e}")
@@ -191,20 +200,16 @@ async def analyze_step(file: UploadFile = File(...)):
 
         bbox = shape.BoundingBox()
         bbox_dims = {"x": round(bbox.xlen, 3), "y": round(bbox.ylen, 3), "z": round(bbox.zlen, 3)}
-        dims_sorted = dict(sorted(bbox_dims.items(), key=lambda x: x[1], reverse=True))
         volume_mm3 = float(shape.Volume()) if shape.Volume() else None
 
-        # Detecties
         strict_holes = detect_analytic_holes_strict(shape)
         all_inner = detect_all_inner_contours(shape)
 
-        # STL export
         base_name, _ = os.path.splitext(file.filename)
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
         stl_url = upload_to_supabase(stl_path, f"{base_name}.stl")
 
-        # GLB generatie
         green = [0, 255, 0, 255]
         light_blue = [150, 200, 255, 255]
         mesh = trimesh.load_mesh(stl_path)
@@ -234,9 +239,6 @@ async def analyze_step(file: UploadFile = File(...)):
                 "holes_data": strict_holes,
                 "inner_contours": all_inner,
                 "units": "mm",
-                "bounding_box_x": bbox_dims["x"],
-                "bounding_box_y": bbox_dims["y"],
-                "bounding_box_z": bbox_dims["z"],
                 "model_url": stl_url,
                 "model_url_glb": glb_url
             }).execute()
