@@ -15,7 +15,7 @@ from datetime import datetime
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.0.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,13 +42,15 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🕳️ Oude strikte ronde gaten (ter info)
+# 🕳️ (Optioneel) strikte ronde gaten
 # -------------------------------
-def detect_analytic_holes_strict(shape,
-                                 d_min=2.0, d_max=30.0,
-                                 xy_tol=0.2, d_tol=0.2,
-                                 z_pair_min=1.0, z_pair_max=40.0,
-                                 full_circle_tol_ratio=0.02):
+def detect_analytic_holes_strict(
+    shape,
+    d_min=2.0, d_max=30.0,
+    xy_tol=0.2, d_tol=0.2,
+    z_pair_min=1.0, z_pair_max=40.0,
+    full_circle_tol_ratio=0.02
+):
     circles = []
     for face in shape.Faces():
         for edge in face.Edges():
@@ -81,7 +83,11 @@ def detect_analytic_holes_strict(shape,
     for cx, cy, cz, d in circles:
         placed = False
         for g in groups:
-            if (abs(g["x"] - cx) <= xy_tol and abs(g["y"] - cy) <= xy_tol and abs(g["d"] - d) <= d_tol):
+            if (
+                abs(g["x"] - cx) <= xy_tol and
+                abs(g["y"] - cy) <= xy_tol and
+                abs(g["d"] - d) <= d_tol
+            ):
                 g["zs"].append(cz)
                 placed = True
                 break
@@ -113,8 +119,9 @@ def detect_analytic_holes_strict(shape,
 # -------------------------------
 def detect_all_inner_contours(shape):
     """
-    Detecteert ALLE binnencontouren (rond, vierkant, sleuf, willekeurig)
-    Retourneert lijst met {x,y,z,diameter,dz}.
+    Detecteert ALLE binnencontouren (rond, sleuf, vierkant, willekeurig).
+    Retourneert [{x,y,z,diameter,dz}] waarbij 'diameter' hier de max(xlen,ylen)
+    van de wire-boundingbox is (geschikt als vul-blokbreedte/hoogte).
     """
     holes = []
     for face in shape.Faces():
@@ -124,14 +131,17 @@ def detect_all_inner_contours(shape):
             outer = None
 
         for wire in face.Wires():
+            # Skip de buitenste contour van dit face
             if outer and wire.isSame(outer):
                 continue
+
             bb = wire.BoundingBox()
             cx = (bb.xmin + bb.xmax) / 2
             cy = (bb.ymin + bb.ymax) / 2
             cz = (bb.zmin + bb.zmax) / 2
             dz = bb.zlen if bb.zlen > 0 else 1.0
             diameter_eq = max(bb.xlen, bb.ylen)
+
             holes.append({
                 "x": round(cx, 3),
                 "y": round(cy, 3),
@@ -143,11 +153,12 @@ def detect_all_inner_contours(shape):
     return holes
 
 # -------------------------------
-# 📦 Upload helper (no overwrite)
+# 📦 Upload helper (altijd unieke naam)
 # -------------------------------
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
     """
     Uploadt bestand naar Supabase met unieke naam (geen overschrijving).
+    Geeft de public URL terug.
     """
     if not supabase:
         raise RuntimeError("Supabase client not initialized.")
@@ -182,6 +193,17 @@ def _ensure_step_extension(filename: str):
         )
 
 # -------------------------------
+# 🔍 Basis endpoints
+# -------------------------------
+@app.get("/")
+def root():
+    return {"message": "STEP analyzer ✅ (v2.0.1) — STL+GLB, inner-contours fill"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# -------------------------------
 # 🧮 Analyzer endpoint
 # -------------------------------
 @app.post("/analyze")
@@ -191,41 +213,55 @@ async def analyze_step(file: UploadFile = File(...)):
     glb_path = None
     try:
         _ensure_step_extension(file.filename)
+
+        # tijdelijk bestand schrijven
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        # STEP importeren
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
 
+        # Bounding box & volume
         bbox = shape.BoundingBox()
-        bbox_dims = {"x": round(bbox.xlen, 3), "y": round(bbox.ylen, 3), "z": round(bbox.zlen, 3)}
+        bbox_dims = {
+            "x": round(bbox.xlen, 3),
+            "y": round(bbox.ylen, 3),
+            "z": round(bbox.zlen, 3)
+        }
         volume_mm3 = float(shape.Volume()) if shape.Volume() else None
 
-        strict_holes = detect_analytic_holes_strict(shape)
-        all_inner = detect_all_inner_contours(shape)
+        # Detecties
+        strict_holes = detect_analytic_holes_strict(shape)   # info / tabellen
+        all_inner = detect_all_inner_contours(shape)         # voor GLB-vulling
 
+        # STL export & upload
         base_name, _ = os.path.splitext(file.filename)
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
         stl_url = upload_to_supabase(stl_path, f"{base_name}.stl")
 
+        # GLB bouwen: lichtblauw body + GROENE blokken die binnencontouren opvullen
         green = [0, 255, 0, 255]
         light_blue = [150, 200, 255, 255]
+
         mesh = trimesh.load_mesh(stl_path)
+        if mesh.is_empty:
+            raise RuntimeError("Loaded STL mesh is empty.")
         mesh.visual.vertex_colors = [light_blue] * len(mesh.vertices)
+
         scene = trimesh.Scene()
         scene.add_geometry(mesh, node_name="body")
 
         for idx, hole in enumerate(all_inner):
-    dx = float(hole["diameter"])  # breedte (X)
-    dy = float(hole["diameter"])  # hoogte (Y)
-    dz = float(hole["dz"]) or 1.0  # dikte
-    # Maak een groen blok dat het gat volledig vult
-    box = trimesh.creation.box(extents=[dx, dy, dz])
-    box.visual.vertex_colors = [green] * len(box.vertices)
-    box.apply_translation((hole["x"], hole["y"], hole["z"]))
-    scene.add_geometry(box, node_name=f"hole_{idx}")
+            dx = float(hole["diameter"])      # breedte (X)
+            dy = float(hole["diameter"])      # hoogte (Y)
+            dz = float(hole["dz"]) or 1.0     # dikte (Z)
+            box = trimesh.creation.box(extents=[dx, dy, dz])
+            box.visual.vertex_colors = [green] * len(box.vertices)
+            box.apply_translation((hole["x"], hole["y"], hole["z"]))
+            scene.add_geometry(box, node_name=f"hole_{idx}")
 
         glb_bytes = scene.export(file_type="glb")
         glb_path = tmp_path.replace(".step", ".glb")
@@ -233,6 +269,7 @@ async def analyze_step(file: UploadFile = File(...)):
             f.write(glb_bytes)
         glb_url = upload_to_supabase(glb_path, f"{base_name}.glb")
 
+        # DB insert
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
@@ -245,8 +282,10 @@ async def analyze_step(file: UploadFile = File(...)):
                 "model_url_glb": glb_url
             }).execute()
 
+        # Response
         return JSONResponse(content={
             "status": "success",
+            "units": "mm",
             "boundingBoxMM": bbox_dims,
             "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
             "holesDetected": len(strict_holes),
@@ -260,6 +299,7 @@ async def analyze_step(file: UploadFile = File(...)):
         tb = traceback.format_exc(limit=3)
         return JSONResponse(status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb})
     finally:
+        # opruimen tmp files
         for path in [tmp_path, stl_path, glb_path]:
             try:
                 if path and os.path.exists(path):
@@ -272,6 +312,7 @@ async def analyze_step(file: UploadFile = File(...)):
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
+    # Gebruik je eigen SUPABASE_URL
     url = f"{SUPABASE_URL}/storage/v1/object/public/{path}"
     try:
         async with httpx.AsyncClient() as client:
