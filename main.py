@@ -128,7 +128,7 @@ async def analyze_step(file: UploadFile = File(...)):
 
         # 📤 export GLB (met kleur)
         glb_path = tmp_path.replace(".step", ".glb")
-        cq.exporters.export(colored, glb_path, "GLTF")
+        cq.exporters.export(colored, glb_path, exportType="GLTF")
         glb_url = upload_to_supabase(glb_path, file.filename.replace(".step", ".glb"))
 
         # 🧾 save + response
