@@ -4,15 +4,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import cadquery as cq
 import tempfile
 import os
-import math
 import traceback
 from supabase import create_client, Client
 import httpx
+import math
 
 # ============================================================
 # 🌍 App configuratie
 # ============================================================
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,7 +44,7 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # ============================================================
-# 🕳️ Detecteer binnencontouren (edges met inner loops)
+# 🕳️ Detecteer binnencontouren
 # ============================================================
 def detect_inner_contours(shape):
     contours = []
@@ -98,7 +98,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
 # ============================================================
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (v1.8.0 - inner contours + colors)"}
+    return {"message": "STEP analyzer live ✅ (v1.8.2 - blue base + green inner contours)"}
 
 @app.get("/health")
 def health():
@@ -150,27 +150,9 @@ async def analyze_step(file: UploadFile = File(...)):
         # 🟢 Detect binnencontouren
         inner_contours = detect_inner_contours(shape)
 
-        # 🎨 Maak blauw basismodel via Assembly (ondersteunt kleur in GLB)
-asm = cq.Assembly()
-asm.add(shape, color=cq.Color(0, 0, 1))  # blauw
-
-# 🟢 Voeg groene patches toe (zichtbare binnencontouren)
-for contour in inner_contours:
-    try:
-        pts = contour["points"]
-        if not pts or len(pts) < 3:
-            continue
-        avg_z = sum(p[2] for p in pts) / len(pts)
-        projected_pts = [cq.Vector(p[0], p[1], avg_z + 0.1) for p in pts]
-
-        if projected_pts[0] != projected_pts[-1]:
-            projected_pts.append(projected_pts[0])
-
-        wire = cq.Wire.makePolygon(projected_pts)
-        face = cq.Face.makeFromWires(wire)
-        asm.add(face, color=cq.Color(0, 1, 0))  # groen
-    except Exception as e:
-        print(f"⚠️ Failed to create green patch for contour {contour.get('id', '?')}: {e}")
+        # 🎨 Maak een Assembly zodat kleuren correct in GLB renderen
+        asm = cq.Assembly()
+        asm.add(shape, color=cq.Color(0, 0, 1))  # blauw basisdeel
 
         # 🟢 Voeg groene patches toe (zichtbare binnencontouren)
         for contour in inner_contours:
@@ -179,14 +161,13 @@ for contour in inner_contours:
                 if not pts or len(pts) < 3:
                     continue
                 avg_z = sum(p[2] for p in pts) / len(pts)
-                projected_pts = [cq.Vector(p[0], p[1], avg_z + 0.1) for p in pts]
-
+                projected_pts = [cq.Vector(p[0], p[1], avg_z + 0.05) for p in pts]
                 if projected_pts[0] != projected_pts[-1]:
                     projected_pts.append(projected_pts[0])
 
                 wire = cq.Wire.makePolygon(projected_pts)
                 face = cq.Face.makeFromWires(wire)
-                blue_model.add(face, color=cq.Color(0, 1, 0))  # groen
+                asm.add(face, color=cq.Color(0, 1, 0))  # groen
             except Exception as e:
                 print(f"⚠️ Failed to create green patch for contour {contour.get('id', '?')}: {e}")
 
@@ -202,7 +183,7 @@ for contour in inner_contours:
         stl_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
         glb_url = upload_to_supabase(glb_path, file.filename.replace(".step", ".glb"))
 
-        # 🧾 Opslaan in database
+        # 🧾 Opslaan in database (alleen glb-url)
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
