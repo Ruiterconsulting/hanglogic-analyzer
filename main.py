@@ -1,17 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 import cadquery as cq
 import tempfile
-import os, math, traceback
+import os
+import traceback
 from supabase import create_client, Client
-import httpx
 import trimesh
+import numpy as np
 
-# =====================================================
+# -------------------------------
 # 🌍 App configuratie
-# =====================================================
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.3")
+# -------------------------------
+app = FastAPI(title="HangLogic Analyzer API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,271 +22,123 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =====================================================
+# -------------------------------
 # 🔑 Supabase setup
-# =====================================================
+# -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 supabase: Client | None = None
+
 if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Connected to Supabase.")
-    except Exception as e:
-        print("⚠️ Could not initialize Supabase client:", e)
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Connected to Supabase.")
 else:
-    print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
+    print("⚠️ Missing Supabase credentials.")
 
+# -------------------------------
+# 📦 Upload helper
+# -------------------------------
+def upload_to_supabase(local_path: str, remote_name: str) -> str:
+    bucket = "cad-models"
+    remote_path = f"analyzed/{remote_name}"
+    storage = supabase.storage.from_(bucket)
+    with open(local_path, "rb") as f:
+        storage.upload(remote_path, f)
+    return storage.get_public_url(remote_path)
 
-# =====================================================
-# 🧭 Helpers
-# =====================================================
-def _ensure_step_extension(filename: str):
-    ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".step", ".stp"]:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP",
-        )
-
-
-def upload_public(bucket: str, local_path: str, remote_path: str) -> str:
-    """Upload file naar Supabase bucket en retourneer public URL."""
-    if not supabase:
-        raise RuntimeError("Supabase client not initialized.")
-    sto = supabase.storage.from_(bucket)
-    try:
-        files = sto.list(path=os.path.dirname(remote_path) or "")
-        for f in files:
-            name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
-            if name == os.path.basename(remote_path):
-                sto.remove([remote_path])
-                break
-    except Exception:
-        pass
-    with open(local_path, "rb") as fh:
-        sto.upload(remote_path, fh)
-    return sto.get_public_url(remote_path)
-
-
-# =====================================================
-# 🧮 Geometrische hulpfuncties
-# =====================================================
-def _face_normal(face: cq.Face):
-    """
-    Berekent de normale van een vlak – compatibel met alle CadQuery/OCC-versies.
-    """
-    try:
-        umin, umax, vmin, vmax = face.uMin(), face.uMax(), face.vMin(), face.vMax()
-        u = (umin + umax) / 2.0
-        v = (vmin + vmax) / 2.0
-        n = face.normalAt(u, v)
-        return n.normalized()
-    except TypeError:
-        n = face.normalAt(0.5)
-        return n.normalized()
-    except Exception as e:
-        print(f"⚠️ _face_normal fallback: {e}")
-        return cq.Vector(0, 0, 1)
-
-
-# =====================================================
-# 🎨 Groene binnen-patches
-# =====================================================
-def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8):
-    """
-    Vult alle binnencontouren (holes/uitsparingen) met dunne groene patches.
-    Werkt ook bij non-planar of onvolledige wires.
-    """
-    green_solids = []
-    total_wires = 0
-    failed = 0
-
+# -------------------------------
+# 🕳️ Binnencontour detectie
+# -------------------------------
+def detect_inner_faces(shape):
+    inner_faces = []
     for face in shape.Faces():
-        wires = face.Wires()
-        if len(wires) <= 1:
+        try:
+            normal = face.normalAt(0.5, 0.5)
+            if normal.z < 0:  # simpele binnencontour-heuristiek
+                inner_faces.append(face)
+        except Exception:
             continue
-        inner = wires[1:]
-        total_wires += len(inner)
-        n = _face_normal(face)
-        if n.Length == 0:
-            continue
-        n = n.normalized()
+    return inner_faces
 
-        for w in inner:
-            try:
-                patch_face = cq.Face.makeFromWires(w)
-                patch_solid = patch_face.extrude(n * thickness)
-                green_solids.append(patch_solid)
-            except Exception:
-                try:
-                    pts = [v.toTuple() for v in w.Vertices()]
-                    if len(pts) >= 3:
-                        cx = sum(p[0] for p in pts) / len(pts)
-                        cy = sum(p[1] for p in pts) / len(pts)
-                        cz = sum(p[2] for p in pts) / len(pts)
-                        r = sum(math.dist(p, (cx, cy, cz)) for p in pts) / len(pts)
-                        patch = (
-                            cq.Workplane("XY")
-                            .moveTo(cx, cy)
-                            .circle(r)
-                            .extrude(thickness)
-                        )
-                        green_solids.append(patch.val())
-                    else:
-                        failed += 1
-                except Exception:
-                    failed += 1
-                    continue
-
-    print(
-        f"✅ Found {total_wires} inner wires; built {len(green_solids)} green patches; failed {failed}"
+# -------------------------------
+# 🎨 Helper om kleur toe te voegen aan mesh
+# -------------------------------
+def make_colored_mesh_from_shape(shape, color_hex="#0A0F4B"):
+    mesh = cq.Mesh.exportMesh(shape)
+    tri = trimesh.Trimesh(
+        vertices=np.array(mesh.vertices, dtype=float),
+        faces=np.array(mesh.faces, dtype=int).reshape(-1, 3),
+        process=False
     )
-    if not green_solids:
-        return None
-    return cq.Compound.makeCompound(green_solids)
+    color_rgb = np.array([
+        int(color_hex[1:3], 16),
+        int(color_hex[3:5], 16),
+        int(color_hex[5:7], 16),
+        255
+    ])
+    tri.visual.vertex_colors = np.tile(color_rgb, (len(tri.vertices), 1))
+    return tri
 
-
-# =====================================================
-# 🔍 Basis endpoints
-# =====================================================
-@app.get("/")
-def root():
-    return {
-        "message": "STEP analyzer live ✅ (v1.8.3 — STL+GLB export, green inner patches)"
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# =====================================================
-# 🧠 Analyzer
-# =====================================================
+# -------------------------------
+# 🧮 Analyzer endpoint
+# -------------------------------
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
     try:
-        _ensure_step_extension(file.filename)
+        # 1️⃣ opslaan
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        # 2️⃣ import
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
         print(f"🧠 Analyzing: {file.filename}")
 
-        bbox = shape.BoundingBox()
-        dims = {
-            "X": round(float(bbox.xlen), 3),
-            "Y": round(float(bbox.ylen), 3),
-            "Z": round(float(bbox.zlen), 3),
-        }
-        try:
-            volume = round(float(shape.Volume()), 3)
-        except Exception:
-            volume = None
+        # 3️⃣ binnencontouren
+        inner_faces = detect_inner_faces(shape)
+        print(f"✅ Found {len(inner_faces)} inner faces")
 
-        # groene patches maken
-        green = build_green_patches_from_inner_wires(shape, thickness=0.8)
-
-        # 3D-assembly opbouwen
-        asm = cq.Assembly()
-        asm.add(shape, name="body", color=cq.Color(0.02, 0.06, 0.28))
-        if green:
-            asm.add(green, name="inner_patches", color=cq.Color(0.05, 0.85, 0.2))
-
-        # exporteren naar STL
-        stl_path = tmp_path.replace(".step", ".stl")
-        cq.exporters.export(shape, stl_path, "STL")
-
-        # converteer STL → GLB via trimesh
-        glb_path = tmp_path.replace(".step", ".glb")
-        try:
-            mesh = trimesh.load_mesh(stl_path)
-            mesh.export(glb_path)
-            print("✅ Converted STL to GLB via trimesh")
-        except Exception as e:
-            print(f"⚠️ Failed to create GLB: {e}")
-            glb_path = None
-
-        base = os.path.splitext(file.filename)[0]
-        stl_url = upload_public("cad-models", stl_path, f"analyzed/{base}.stl")
-        glb_url = (
-            upload_public("cad-models", glb_path, f"analyzed/{base}.glb")
-            if glb_path
-            else None
-        )
-
-        # Supabase database insert
-        if supabase:
-            data = {
-                "filename": file.filename,
-                "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
-                "units": "mm",
-                "volume_mm3": volume,
-                "bounding_box_x": dims["X"],
-                "bounding_box_y": dims["Y"],
-                "bounding_box_z": dims["Z"],
-                "model_url": stl_url,
-                "model_url_glb": glb_url,
-                "created_at": "now()",
-            }
+        # 4️⃣ naar meshes
+        blue_mesh = make_colored_mesh_from_shape(shape, "#0A0F4B")
+        green_meshes = []
+        for f in inner_faces:
             try:
-                supabase.table("analyzed_parts").insert(data).execute()
+                m = make_colored_mesh_from_shape(f, "#09D34B")
+                green_meshes.append(m)
             except Exception as e:
-                print("⚠️ Supabase insert failed:", e)
+                print(f"⚠️ Failed face mesh: {e}")
 
-        return JSONResponse(
-            {
-                "status": "success",
-                "units": "mm",
-                "boundingBoxMM": dims,
-                "volumeMM3": volume,
+        all_meshes = [blue_mesh] + green_meshes
+        combined = trimesh.util.concatenate(all_meshes)
+
+        # 5️⃣ export GLB
+        glb_path = tmp_path.replace(".step", ".glb")
+        combined.export(glb_path)
+        glb_url = upload_to_supabase(glb_path, file.filename.replace(".step", ".glb"))
+        print("🌍 GLB uploaded to:", glb_url)
+
+        # 6️⃣ Supabase log
+        if supabase:
+            supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "modelURL": stl_url,
-                "modelURL_glb": glb_url,
-            }
-        )
+                "model_url_glb": glb_url
+            }).execute()
+
+        return JSONResponse(content={
+            "status": "success",
+            "filename": file.filename,
+            "model_url_glb": glb_url
+        })
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(
-            status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb}
-        )
+        print("❌ Error:", e)
+        return JSONResponse(status_code=500, content={
+            "error": f"Analysis failed: {e}",
+            "trace": tb
+        })
     finally:
-        if tmp_path:
-            for p in (
-                tmp_path,
-                tmp_path.replace(".step", ".stl"),
-                tmp_path.replace(".step", ".glb"),
-            ):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-
-
-# =====================================================
-# 🌐 Proxy voor CORS
-# =====================================================
-@app.get("/proxy/{path:path}")
-async def proxy_file(path: str):
-    url = f"https://{SUPABASE_URL.split('//')[-1]}/storage/v1/object/public/{path}"
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url)
-            r.raise_for_status()
-        headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Content-Type": r.headers.get("content-type", "application/octet-stream"),
-        }
-        return StreamingResponse(iter([r.content]), headers=headers)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {e}"})
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
