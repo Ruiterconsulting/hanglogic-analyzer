@@ -218,12 +218,14 @@ async def analyze_step(file: UploadFile = File(...)):
         scene.add_geometry(mesh, node_name="body")
 
         for idx, hole in enumerate(all_inner):
-            radius = max(float(hole["diameter"]) / 6.0, 0.5)
-            height = max(float(hole["dz"]) * 2.0, 1.0)
-            cyl = trimesh.creation.cylinder(radius=radius, height=height, sections=32)
-            cyl.visual.vertex_colors = [green] * len(cyl.vertices)
-            cyl.apply_translation((hole["x"], hole["y"], hole["z"]))
-            scene.add_geometry(cyl, node_name=f"hole_{idx}")
+    dx = float(hole["diameter"])  # breedte (X)
+    dy = float(hole["diameter"])  # hoogte (Y)
+    dz = float(hole["dz"]) or 1.0  # dikte
+    # Maak een groen blok dat het gat volledig vult
+    box = trimesh.creation.box(extents=[dx, dy, dz])
+    box.visual.vertex_colors = [green] * len(box.vertices)
+    box.apply_translation((hole["x"], hole["y"], hole["z"]))
+    scene.add_geometry(box, node_name=f"hole_{idx}")
 
         glb_bytes = scene.export(file_type="glb")
         glb_path = tmp_path.replace(".step", ".glb")
