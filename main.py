@@ -117,21 +117,30 @@ def detect_all_inner_contours(shape):
     """
     holes = []
     for face in shape.Faces():
+        try:
+            outer = face.outerWire()
+        except Exception:
+            outer = None
+
         for wire in face.Wires():
-            if not wire.isOuter:
-                bb = wire.BoundingBox()
-                cx = (bb.xmin + bb.xmax) / 2
-                cy = (bb.ymin + bb.ymax) / 2
-                cz = (bb.zmin + bb.zmax) / 2
-                dz = bb.zlen if bb.zlen > 0 else 1.0
-                diameter_eq = max(bb.xlen, bb.ylen)
-                holes.append({
-                    "x": round(cx, 3),
-                    "y": round(cy, 3),
-                    "z": round(cz, 3),
-                    "diameter": round(diameter_eq, 3),
-                    "dz": round(dz, 3)
-                })
+            # skip de buitenste contour van het vlak
+            if outer and wire.isSame(outer):
+                continue
+
+            # dit is dus een binnencontour
+            bb = wire.BoundingBox()
+            cx = (bb.xmin + bb.xmax) / 2
+            cy = (bb.ymin + bb.ymax) / 2
+            cz = (bb.zmin + bb.zmax) / 2
+            dz = bb.zlen if bb.zlen > 0 else 1.0
+            diameter_eq = max(bb.xlen, bb.ylen)
+            holes.append({
+                "x": round(cx, 3),
+                "y": round(cy, 3),
+                "z": round(cz, 3),
+                "diameter": round(diameter_eq, 3),
+                "dz": round(dz, 3)
+            })
     print(f"🟢 Detected {len(holes)} inner contours (any shape).")
     return holes
 
