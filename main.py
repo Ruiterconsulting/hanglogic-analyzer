@@ -12,11 +12,11 @@ import httpx
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.0 - innerContours")
+app = FastAPI(title="HangLogic Analyzer API", version="2.0.0 - GLB colors")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # evt. beperken tot jouw Lovable domeinen
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,18 +33,13 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Connected to Supabase.")
-        try:
-            buckets = supabase.storage.list_buckets()
-            print("📦 Buckets found:", [b.name for b in buckets])
-        except Exception as e:
-            print("⚠️ Could not list buckets:", e)
     except Exception as e:
         print("⚠️ Could not initialize Supabase client:", e)
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🧠 Binnencontouren detectie
+# 🧠 Binnencontour detectie
 # -------------------------------
 def extract_inner_contours(shape):
     contours = []
@@ -60,7 +55,6 @@ def extract_inner_contours(shape):
                     for v in e.Vertices():
                         p = v.toTuple()
                         pts.append([round(p[0], 3), round(p[1], 3), round(p[2], 3)])
-                # Controleer of dit een echte binnencontour is (geen buitenrand)
                 if len(pts) >= 3:
                     cx = sum(p[0] for p in pts) / len(pts)
                     cy = sum(p[1] for p in pts) / len(pts)
@@ -77,36 +71,6 @@ def extract_inner_contours(shape):
     return contours
 
 # -------------------------------
-# 🕳️ Strikte ronde gaten (optioneel)
-# -------------------------------
-def detect_analytic_holes_strict(shape, d_min=1.0, d_max=1000.0):
-    circles = []
-    for face in shape.Faces():
-        for edge in face.Edges():
-            if edge.geomType() != "CIRCLE":
-                continue
-            try:
-                circ = edge._geomAdaptor().Circle()
-                loc = circ.Location()
-                r = float(circ.Radius())
-                if r <= 0:
-                    continue
-                cx, cy, cz = float(loc.X()), float(loc.Y()), float(loc.Z())
-                d = 2.0 * r
-                if not (d_min <= d <= d_max):
-                    continue
-                circles.append({
-                    "x": round(cx, 3),
-                    "y": round(cy, 3),
-                    "z": round(cz, 3),
-                    "diameter": round(d, 3)
-                })
-            except Exception:
-                continue
-    print(f"🕳️ Detected {len(circles)} round holes (analytic).")
-    return circles
-
-# -------------------------------
 # 📦 Upload helper
 # -------------------------------
 def upload_to_supabase(local_path: str, remote_name: str) -> str:
@@ -115,50 +79,12 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     bucket = "cad-models"
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
-    try:
-        # Verwijder oud bestand
-        try:
-            files = storage.list(path="analyzed")
-            for f in files:
-                name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
-                if name == remote_name:
-                    print(f"⚠️ Bestand {remote_name} bestaat al — verwijderen...")
-                    storage.remove([f"analyzed/{remote_name}"])
-                    break
-        except Exception as e:
-            print("ℹ️ Geen bestaande bestanden gevonden:", e)
 
-        with open(local_path, "rb") as f:
-            res = storage.upload(remote_path, f)
-        print("✅ Upload gelukt:", res)
-
-        public_url = storage.get_public_url(remote_path)
-        print("🌍 Public URL:", public_url)
-        return public_url
-    except Exception as e:
-        raise RuntimeError(f"Upload to Supabase failed: {e}")
-
-# -------------------------------
-# 🔍 Basis endpoints
-# -------------------------------
-@app.get("/")
-def root():
-    return {"message": "STEP analyzer live ✅ (v1.8.0 - innerContours + STL export)"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# -------------------------------
-# 🧰 Bestandstype check
-# -------------------------------
-def _ensure_step_extension(filename: str):
-    ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".step", ".stp"]:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP"
-        )
+    with open(local_path, "rb") as f:
+        res = storage.upload(remote_path, f)
+    print("✅ Upload:", remote_name)
+    public_url = storage.get_public_url(remote_path)
+    return public_url
 
 # -------------------------------
 # 🧮 Analyzer endpoint
@@ -167,72 +93,102 @@ def _ensure_step_extension(filename: str):
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
     try:
-        _ensure_step_extension(file.filename)
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".step", ".stp"]:
+            raise HTTPException(status_code=415, detail="Upload .STEP or .STP only")
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # 1️⃣ STEP importeren
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
         print(f"🧠 Analyzing: {file.filename}")
 
-        # 2️⃣ Bounding box
+        # Bounding box
         bbox = shape.BoundingBox()
-        raw_dims = {"x": round(bbox.xlen, 3), "y": round(bbox.ylen, 3), "z": round(bbox.zlen, 3)}
-        sorted_dims = sorted(raw_dims.values(), reverse=True)
-        dims = {"X": sorted_dims[0], "Y": sorted_dims[1], "Z": sorted_dims[2]}
+        dims = {
+            "X": round(bbox.xlen, 3),
+            "Y": round(bbox.ylen, 3),
+            "Z": round(bbox.zlen, 3),
+        }
 
-        # 3️⃣ Volume
+        # Volume
         try:
             volume_mm3 = float(shape.Volume())
         except Exception:
             volume_mm3 = None
 
-        # 4️⃣ Detecties
+        # Detect binnencontouren
         inner_contours = extract_inner_contours(shape)
-        holes = detect_analytic_holes_strict(shape)
-        holes_detected = len(holes)
 
-        # 5️⃣ STL export
+        # -------------------------------
+        # 🔵 Maak blauw hoofdmodel
+        # -------------------------------
+        blue_model = cq.Assembly()
+        blue_model.add(shape, color=cq.Color(0, 0, 1))  # blauw RGB(0,0,1)
+
+        # -------------------------------
+        # 🟢 Voeg groene vlakken toe op binnencontouren
+        # -------------------------------
+        for contour in inner_contours:
+            pts = [cq.Vector(p[0], p[1], p[2]) for p in contour["points"]]
+            try:
+                wire = cq.Wire.makePolygon(pts, True)
+                face = cq.Face.makeFromWires(wire)
+                blue_model.add(face, color=cq.Color(0, 1, 0))  # groen RGB(0,1,0)
+            except Exception as e:
+                print(f"⚠️ Failed to create green patch for contour {contour['id']}: {e}")
+
+        # -------------------------------
+        # 📦 Exporteer STL en GLB
+        # -------------------------------
         stl_path = tmp_path.replace(".step", ".stl")
+        glb_path = tmp_path.replace(".step", ".glb")
+
         cq.exporters.export(shape, stl_path, "STL")
+        blue_model.save(glb_path)  # kleurinformatie inbegrepen
 
-        # 6️⃣ Upload
+        # -------------------------------
+        # ☁️ Upload beide bestanden
+        # -------------------------------
         stl_public_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
+        glb_public_url = upload_to_supabase(glb_path, file.filename.replace(".step", ".glb"))
 
-        # 7️⃣ Opslaan in Supabase database
+        # -------------------------------
+        # 💾 Opslaan in Supabase database
+        # -------------------------------
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "holes_detected": holes_detected,
-                "holes_data": holes,
-                "inner_contours": inner_contours,
                 "bounding_box_x": dims["X"],
                 "bounding_box_y": dims["Y"],
                 "bounding_box_z": dims["Z"],
                 "volume_mm3": volume_mm3,
-                "model_url": stl_public_url,
+                "inner_contours": inner_contours,
+                "model_url_stl": stl_public_url,
+                "model_url_glb": glb_public_url,
             }).execute()
 
-        # 8️⃣ Resultaat terugsturen
+        # -------------------------------
+        # ✅ Response
+        # -------------------------------
         return JSONResponse(content={
             "status": "success",
             "units": "mm",
             "boundingBoxMM": dims,
             "volumeMM3": round(volume_mm3, 3) if volume_mm3 else None,
             "filename": file.filename,
-            "holesDetected": holes_detected,
-            "holes": holes,
             "innerContours": inner_contours,
-            "modelURL": stl_public_url,
+            "modelURL_STL": stl_public_url,
+            "modelURL_GLB": glb_public_url,
         })
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb})
+        return JSONResponse(status_code=500, content={"error": str(e), "trace": tb})
     finally:
-        for path in [tmp_path, tmp_path.replace(".step", ".stl") if tmp_path else None]:
+        for path in [tmp_path, tmp_path.replace(".step", ".stl"), tmp_path.replace(".step", ".glb")]:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -240,7 +196,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 pass
 
 # -------------------------------
-# 🌐 Proxy voor CORS
+# 🌐 Proxy endpoint
 # -------------------------------
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
@@ -257,5 +213,4 @@ async def proxy_file(path: str):
         }
         return StreamingResponse(iter([r.content]), headers=headers)
     except Exception as e:
-        print("⚠️ Proxy fetch failed:", e)
-        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {str(e)}"})
+        return JSONResponse(status_code=500, content={"error": f"Proxy failed: {e}"})
