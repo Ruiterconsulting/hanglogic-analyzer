@@ -8,11 +8,12 @@ import traceback
 from supabase import create_client, Client
 import trimesh
 import numpy as np
+from io import BytesIO
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,30 +55,29 @@ def detect_inner_faces(shape):
     for face in shape.Faces():
         try:
             normal = face.normalAt(0.5, 0.5)
-            if normal.z < 0:  # simpele binnencontour-heuristiek
+            if normal.z < 0:  # heuristiek voor “binnen”
                 inner_faces.append(face)
         except Exception:
             continue
     return inner_faces
 
 # -------------------------------
-# 🎨 Helper om kleur toe te voegen aan mesh
+# 🎨 Maak gekleurde Trimesh uit CQ-shape
 # -------------------------------
 def make_colored_mesh_from_shape(shape, color_hex="#0A0F4B"):
-    mesh = cq.Mesh.exportMesh(shape)
-    tri = trimesh.Trimesh(
-        vertices=np.array(mesh.vertices, dtype=float),
-        faces=np.array(mesh.faces, dtype=int).reshape(-1, 3),
-        process=False
-    )
+    """Exporteer CadQuery-shape naar STL, lees het met trimesh, en kleur."""
+    stl_bytes = cq.exporters.toString(shape, "STL").encode("utf-8")
+    mesh = trimesh.load(BytesIO(stl_bytes), file_type="stl")
+
     color_rgb = np.array([
         int(color_hex[1:3], 16),
         int(color_hex[3:5], 16),
         int(color_hex[5:7], 16),
         255
-    ])
-    tri.visual.vertex_colors = np.tile(color_rgb, (len(tri.vertices), 1))
-    return tri
+    ], dtype=np.uint8)
+
+    mesh.visual.vertex_colors = np.tile(color_rgb, (len(mesh.vertices), 1))
+    return mesh
 
 # -------------------------------
 # 🧮 Analyzer endpoint
@@ -100,7 +100,7 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_faces(shape)
         print(f"✅ Found {len(inner_faces)} inner faces")
 
-        # 4️⃣ naar meshes
+        # 4️⃣ kleuren
         blue_mesh = make_colored_mesh_from_shape(shape, "#0A0F4B")
         green_meshes = []
         for f in inner_faces:
@@ -110,8 +110,7 @@ async def analyze_step(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"⚠️ Failed face mesh: {e}")
 
-        all_meshes = [blue_mesh] + green_meshes
-        combined = trimesh.util.concatenate(all_meshes)
+        combined = trimesh.util.concatenate([blue_mesh] + green_meshes)
 
         # 5️⃣ export GLB
         glb_path = tmp_path.replace(".step", ".glb")
