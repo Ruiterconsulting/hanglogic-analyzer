@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import cadquery as cq
+from cadquery import Color
 import tempfile
 import os
 import math
@@ -10,7 +11,7 @@ from supabase import create_client, Client
 import httpx
 
 
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.8")
+app = FastAPI(title="HangLogic Analyzer API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +37,7 @@ else:
 
 
 # ------------------------------
-# Upload helper
+# Upload helper (unique filenames)
 # ------------------------------
 def upload_new_file(local_path: str, remote_name: str) -> str:
     if not supabase:
@@ -58,7 +59,7 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
 
 
 # ------------------------------
-# Detect inner wires
+# Detect inner wires (all interior contours)
 # ------------------------------
 def detect_inner_wires(shape):
     data = []
@@ -69,10 +70,10 @@ def detect_inner_wires(shape):
         if len(wires) <= 1:
             continue
 
-        outer = wires[0]
-        inners = wires[1:]
+        # wire 0 = outer boundary
+        inner = wires[1:]
 
-        data.append((f_idx, face, inners))
+        data.append((f_idx, face, inner))
 
     return data
 
@@ -80,7 +81,7 @@ def detect_inner_wires(shape):
 # ------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "2.2.8"}
+    return {"status": "ok", "version": "2.3.0"}
 
 
 def ensure_step(filename):
@@ -121,24 +122,41 @@ async def analyze_step(file: UploadFile = File(...)):
         filled_solids = []
 
         # -----------------------------
-        # Generate fills
+        # Generate contour fills
         # -----------------------------
         for f_idx, face, wires in inner_data:
             for w_idx, wire in enumerate(wires):
 
-                # Skip invalid wires
+                # STRONG WIRE VALIDATION
                 try:
-                    if wire.isNull() or wire.Length() < 0.5:
-                        print(f"⚠️ skipping null/short wire {w_idx}")
+                    if wire.isNull():
+                        print(f"⚠️ Null wire on face {f_idx}, wire {w_idx}")
                         continue
-                except:
+
+                    if wire.Length() < 0.1:
+                        print(f"⚠️ tiny wire skipped on face {f_idx}, wire {w_idx}")
+                        continue
+
+                    edges = wire.Edges()
+                    if len(edges) == 0:
+                        print(f"⚠️ zero-edge wire skipped")
+                        continue
+
+                    if any(e.isNull() for e in edges):
+                        print(f"⚠️ null edge detected in wire")
+                        continue
+
+                except Exception as e:
+                    print(f"⚠️ wire validation failed: {e}")
                     continue
 
+                # Normal
                 try:
                     normal = face.normalAt()
                 except:
                     normal = cq.Vector(0, 0, 1)
 
+                # Centerpoint
                 try:
                     center = wire.Center()
                 except:
@@ -152,32 +170,33 @@ async def analyze_step(file: UploadFile = File(...)):
                 try:
                     wp = cq.Workplane(plane).add(wire)
 
+                    # Symmetric through full plate
                     pos = wp.toPending().extrude(thickness / 2)
                     neg = wp.toPending().extrude(-thickness / 2)
-                    fill = pos.union(neg)
+                    solid = pos.union(neg)
 
-                    filled_solids.append(fill)
+                    filled_solids.append(solid)
 
                 except Exception as e:
-                    print(f"⚠️ fill failed: face {f_idx}, wire {w_idx}: {e}")
+                    print(f"⚠️ fill failed on face {f_idx}, wire {w_idx}: {e}")
 
         # -----------------------------
-        # Build GLB assembly
+        # Build GLB assembly (Colors MUST be `Color()` objects)
         # -----------------------------
-        blue = (0.6, 0.8, 1.0)
-        green = (0.0, 1.0, 0.0)
+        color_base = Color(0.6, 0.8, 1.0)
+        color_fill = Color(0.0, 1.0, 0.0)
 
         asm = cq.Assembly()
 
-        asm.add(shape, name="base", color=blue)
+        asm.add(shape, name="base", color=color_base)
 
         for idx, solid in enumerate(filled_solids):
-            asm.add(solid, name=f"fill_{idx}", color=green)
+            asm.add(solid, name=f"fill_{idx}", color=color_fill)
 
         tmp_glb = tmp_step.replace(".step", ".glb")
         asm.save(tmp_glb, exportType="GLTF")
 
-        # STL export
+        # STL
         tmp_stl = tmp_step.replace(".step", ".stl")
         cq.exporters.export(shape, tmp_stl, "STL")
 
@@ -185,6 +204,7 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_url = upload_new_file(tmp_stl, file.filename.replace(".step", ".stl"))
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
+        # DB
         supabase.table("analyzed_parts").insert({
             "filename": file.filename,
             "dimensions": dims,
