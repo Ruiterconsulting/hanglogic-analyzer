@@ -6,11 +6,12 @@ import tempfile
 import os, math, traceback
 from supabase import create_client, Client
 import httpx
+import trimesh
 
 # =====================================================
 # 🌍 App configuratie
 # =====================================================
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.2")
+app = FastAPI(title="HangLogic Analyzer API", version="1.8.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,22 +83,11 @@ def _face_normal(face: cq.Face):
         n = face.normalAt(u, v)
         return n.normalized()
     except TypeError:
-        # oudere OCC-versie: accepteert één argument
         n = face.normalAt(0.5)
         return n.normalized()
     except Exception as e:
         print(f"⚠️ _face_normal fallback: {e}")
         return cq.Vector(0, 0, 1)
-
-
-def _wire_center_approx(wire: cq.Wire):
-    vs = [v.toTuple() for v in wire.Vertices()]
-    if not vs:
-        return (0.0, 0.0, 0.0)
-    cx = sum(p[0] for p in vs) / len(vs)
-    cy = sum(p[1] for p in vs) / len(vs)
-    cz = sum(p[2] for p in vs) / len(vs)
-    return (cx, cy, cz)
 
 
 # =====================================================
@@ -163,7 +153,7 @@ def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8
 @app.get("/")
 def root():
     return {
-        "message": "STEP analyzer live ✅ (v1.8.2 — GLTF with green inner patches)"
+        "message": "STEP analyzer live ✅ (v1.8.3 — STL+GLB export, green inner patches)"
     }
 
 
@@ -202,23 +192,35 @@ async def analyze_step(file: UploadFile = File(...)):
         # groene patches maken
         green = build_green_patches_from_inner_wires(shape, thickness=0.8)
 
-        # GLTF-scene samenstellen
+        # 3D-assembly opbouwen
         asm = cq.Assembly()
-        asm.add(shape, name="body", color=cq.Color(0.02, 0.06, 0.28))  # donkerblauw
+        asm.add(shape, name="body", color=cq.Color(0.02, 0.06, 0.28))
         if green:
-            asm.add(green, name="inner_patches", color=cq.Color(0.05, 0.85, 0.2))  # groen
+            asm.add(green, name="inner_patches", color=cq.Color(0.05, 0.85, 0.2))
 
-        # exporteren
+        # exporteren naar STL
         stl_path = tmp_path.replace(".step", ".stl")
-        gltf_path = tmp_path.replace(".step", ".gltf")
         cq.exporters.export(shape, stl_path, "STL")
-        cq.exporters.export(asm, gltf_path, "GLTF")
+
+        # converteer STL → GLB via trimesh
+        glb_path = tmp_path.replace(".step", ".glb")
+        try:
+            mesh = trimesh.load_mesh(stl_path)
+            mesh.export(glb_path)
+            print("✅ Converted STL to GLB via trimesh")
+        except Exception as e:
+            print(f"⚠️ Failed to create GLB: {e}")
+            glb_path = None
 
         base = os.path.splitext(file.filename)[0]
         stl_url = upload_public("cad-models", stl_path, f"analyzed/{base}.stl")
-        gltf_url = upload_public("cad-models", gltf_path, f"analyzed/{base}.gltf")
+        glb_url = (
+            upload_public("cad-models", glb_path, f"analyzed/{base}.glb")
+            if glb_path
+            else None
+        )
 
-        # Supabase-insert
+        # Supabase database insert
         if supabase:
             data = {
                 "filename": file.filename,
@@ -229,7 +231,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "bounding_box_y": dims["Y"],
                 "bounding_box_z": dims["Z"],
                 "model_url": stl_url,
-                "model_url_gltf": gltf_url,
+                "model_url_glb": glb_url,
                 "created_at": "now()",
             }
             try:
@@ -245,7 +247,7 @@ async def analyze_step(file: UploadFile = File(...)):
                 "volumeMM3": volume,
                 "filename": file.filename,
                 "modelURL": stl_url,
-                "modelURL_gltf": gltf_url,
+                "modelURL_glb": glb_url,
             }
         )
 
@@ -259,8 +261,7 @@ async def analyze_step(file: UploadFile = File(...)):
             for p in (
                 tmp_path,
                 tmp_path.replace(".step", ".stl"),
-                tmp_path.replace(".step", ".gltf"),
-                tmp_path.replace(".step", ".bin"),
+                tmp_path.replace(".step", ".glb"),
             ):
                 try:
                     if os.path.exists(p):
