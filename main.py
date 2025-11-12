@@ -7,7 +7,10 @@ import os, math, traceback
 from supabase import create_client, Client
 import httpx
 
-app = FastAPI(title="HangLogic Analyzer API", version="1.8.0")
+# =====================================================
+# 🌍 App configuratie
+# =====================================================
+app = FastAPI(title="HangLogic Analyzer API", version="1.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,25 +20,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =====================================================
+# 🔑 Supabase setup
+# =====================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print("✅ Connected to Supabase.")
-        try:
-            buckets = supabase.storage.list_buckets()
-            print("📦 Buckets:", [b.name for b in buckets])
-        except Exception as e:
-            print("⚠️ Could not list buckets:", e)
     except Exception as e:
         print("⚠️ Could not initialize Supabase client:", e)
 else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
-# ---------- helpers ----------
 
+# =====================================================
+# 🧭 Helpers
+# =====================================================
 def _ensure_step_extension(filename: str):
     ext = (os.path.splitext(filename)[1] or "").lower()
     if ext not in [".step", ".stp"]:
@@ -44,11 +48,12 @@ def _ensure_step_extension(filename: str):
             detail=f"Unsupported file type '{ext}'. Please upload .STEP or .STP",
         )
 
+
 def upload_public(bucket: str, local_path: str, remote_path: str) -> str:
+    """Upload file naar Supabase bucket en retourneer public URL."""
     if not supabase:
         raise RuntimeError("Supabase client not initialized.")
     sto = supabase.storage.from_(bucket)
-    # upsert via remove-if-exists
     try:
         files = sto.list(path=os.path.dirname(remote_path) or "")
         for f in files:
@@ -62,19 +67,28 @@ def upload_public(bucket: str, local_path: str, remote_path: str) -> str:
         sto.upload(remote_path, fh)
     return sto.get_public_url(remote_path)
 
-# -------------- inner-contour → groene patches --------------
 
-def _face_normal(face: cq.Face) -> cq.Vector:
-    # robuuste normale: middelpunt van boundbox
-    bb = face.BoundingBox()
-    u = 0.5
+# =====================================================
+# 🧮 Geometrische hulpfuncties
+# =====================================================
+def _face_normal(face: cq.Face):
+    """
+    Berekent de normale van een vlak – compatibel met alle CadQuery/OCC-versies.
+    """
     try:
-        # CQ 2.4: normalAt(u, v=None)
-        n = face.normalAt(u)
+        umin, umax, vmin, vmax = face.uMin(), face.uMax(), face.vMin(), face.vMax()
+        u = (umin + umax) / 2.0
+        v = (vmin + vmax) / 2.0
+        n = face.normalAt(u, v)
+        return n.normalized()
     except TypeError:
-        # oudere signatuur: normalAt(u, v)
-        n = face.normalAt(u, 0.5)
-    return n
+        # oudere OCC-versie: accepteert één argument
+        n = face.normalAt(0.5)
+        return n.normalized()
+    except Exception as e:
+        print(f"⚠️ _face_normal fallback: {e}")
+        return cq.Vector(0, 0, 1)
+
 
 def _wire_center_approx(wire: cq.Wire):
     vs = [v.toTuple() for v in wire.Vertices()]
@@ -85,11 +99,14 @@ def _wire_center_approx(wire: cq.Wire):
     cz = sum(p[2] for p in vs) / len(vs)
     return (cx, cy, cz)
 
+
+# =====================================================
+# 🎨 Groene binnen-patches
+# =====================================================
 def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8):
     """
-    Voor elk vlak pakt dit de inner wires (binnencontouren) en
-    maakt een dun groen 'patchje' door de contour te extruderen.
-    Werkt ook bij non-planar of niet-perfecte wires.
+    Vult alle binnencontouren (holes/uitsparingen) met dunne groene patches.
+    Werkt ook bij non-planar of onvolledige wires.
     """
     green_solids = []
     total_wires = 0
@@ -108,45 +125,56 @@ def build_green_patches_from_inner_wires(shape: cq.Shape, thickness: float = 0.8
 
         for w in inner:
             try:
-                # probeer normale face-build
                 patch_face = cq.Face.makeFromWires(w)
                 patch_solid = patch_face.extrude(n * thickness)
                 green_solids.append(patch_solid)
             except Exception:
                 try:
-                    # fallback: maak cirkelpatch via gemiddelde center + radius
                     pts = [v.toTuple() for v in w.Vertices()]
                     if len(pts) >= 3:
                         cx = sum(p[0] for p in pts) / len(pts)
                         cy = sum(p[1] for p in pts) / len(pts)
                         cz = sum(p[2] for p in pts) / len(pts)
-                        # schatting radius
                         r = sum(math.dist(p, (cx, cy, cz)) for p in pts) / len(pts)
-                        patch = cq.Workplane("XY").moveTo(cx, cy).circle(r).extrude(thickness)
+                        patch = (
+                            cq.Workplane("XY")
+                            .moveTo(cx, cy)
+                            .circle(r)
+                            .extrude(thickness)
+                        )
                         green_solids.append(patch.val())
                     else:
                         failed += 1
-                except Exception as e:
+                except Exception:
                     failed += 1
                     continue
 
-    print(f"✅ Found {total_wires} inner wires; built {len(green_solids)} green patches; failed {failed}")
+    print(
+        f"✅ Found {total_wires} inner wires; built {len(green_solids)} green patches; failed {failed}"
+    )
     if not green_solids:
         return None
     return cq.Compound.makeCompound(green_solids)
 
-# -------------- endpoint basics --------------
 
+# =====================================================
+# 🔍 Basis endpoints
+# =====================================================
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (v1.8.0 — GLTF with green inner patches)"}
+    return {
+        "message": "STEP analyzer live ✅ (v1.8.2 — GLTF with green inner patches)"
+    }
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------------- main analyze --------------
 
+# =====================================================
+# 🧠 Analyzer
+# =====================================================
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_path = None
@@ -156,12 +184,10 @@ async def analyze_step(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # STEP → shape
         model = cq.importers.importStep(tmp_path)
         shape = model.val()
         print(f"🧠 Analyzing: {file.filename}")
 
-        # dims & volume
         bbox = shape.BoundingBox()
         dims = {
             "X": round(float(bbox.xlen), 3),
@@ -173,29 +199,28 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume = None
 
-        # bouw groene patches
+        # groene patches maken
         green = build_green_patches_from_inner_wires(shape, thickness=0.8)
 
-        # bouw GLTF scene: blauw body + groen patches
+        # GLTF-scene samenstellen
         asm = cq.Assembly()
         asm.add(shape, name="body", color=cq.Color(0.02, 0.06, 0.28))  # donkerblauw
         if green:
-            asm.add(green, name="inner_patches", color=cq.Color(0.05, 0.85, 0.2))  # felgroen
+            asm.add(green, name="inner_patches", color=cq.Color(0.05, 0.85, 0.2))  # groen
 
-        # export STL (legacy) + GLTF (visueel met groen)
+        # exporteren
         stl_path = tmp_path.replace(".step", ".stl")
         gltf_path = tmp_path.replace(".step", ".gltf")
         cq.exporters.export(shape, stl_path, "STL")
         cq.exporters.export(asm, gltf_path, "GLTF")
 
-        # upload
         base = os.path.splitext(file.filename)[0]
         stl_url = upload_public("cad-models", stl_path, f"analyzed/{base}.stl")
         gltf_url = upload_public("cad-models", gltf_path, f"analyzed/{base}.gltf")
 
-        # sla meta op
+        # Supabase-insert
         if supabase:
-            supabase.table("analyzed_parts").insert({
+            data = {
                 "filename": file.filename,
                 "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
                 "units": "mm",
@@ -206,32 +231,47 @@ async def analyze_step(file: UploadFile = File(...)):
                 "model_url": stl_url,
                 "model_url_gltf": gltf_url,
                 "created_at": "now()",
-            }).execute()
+            }
+            try:
+                supabase.table("analyzed_parts").insert(data).execute()
+            except Exception as e:
+                print("⚠️ Supabase insert failed:", e)
 
-        return JSONResponse({
-            "status": "success",
-            "units": "mm",
-            "boundingBoxMM": dims,
-            "volumeMM3": volume,
-            "filename": file.filename,
-            "modelURL": stl_url,
-            "modelURL_gltf": gltf_url
-        })
+        return JSONResponse(
+            {
+                "status": "success",
+                "units": "mm",
+                "boundingBoxMM": dims,
+                "volumeMM3": volume,
+                "filename": file.filename,
+                "modelURL": stl_url,
+                "modelURL_gltf": gltf_url,
+            }
+        )
 
     except Exception as e:
         tb = traceback.format_exc(limit=3)
-        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb})
+        return JSONResponse(
+            status_code=500, content={"error": f"Analysis failed: {e}", "trace": tb}
+        )
     finally:
         if tmp_path:
-            for p in (tmp_path, tmp_path.replace(".step", ".stl"), tmp_path.replace(".step", ".gltf"), tmp_path.replace(".step", ".bin")):
+            for p in (
+                tmp_path,
+                tmp_path.replace(".step", ".stl"),
+                tmp_path.replace(".step", ".gltf"),
+                tmp_path.replace(".step", ".bin"),
+            ):
                 try:
                     if os.path.exists(p):
                         os.remove(p)
                 except Exception:
                     pass
 
-# --------- public proxy (blijft handig) ---------
 
+# =====================================================
+# 🌐 Proxy voor CORS
+# =====================================================
 @app.get("/proxy/{path:path}")
 async def proxy_file(path: str):
     url = f"https://{SUPABASE_URL.split('//')[-1]}/storage/v1/object/public/{path}"
