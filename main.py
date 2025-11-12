@@ -12,11 +12,11 @@ import httpx
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="1.7.0")
+app = FastAPI(title="HangLogic Analyzer API", version="1.8.0 - innerContours")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # eventueel beperken tot jouw Lovable domeinen
+    allow_origins=["*"],  # evt. beperken tot jouw Lovable domeinen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,22 +44,42 @@ else:
     print("⚠️ SUPABASE_URL or SUPABASE_KEY missing in environment.")
 
 # -------------------------------
-# 🕳️ Strikte Gatdetectie
+# 🧠 Binnencontouren detectie
 # -------------------------------
+def extract_inner_contours(shape):
+    contours = []
+    for face_id, face in enumerate(shape.Faces()):
+        try:
+            inner_wires = face.Wires()
+            for w in inner_wires:
+                edges = w.Edges()
+                if not edges:
+                    continue
+                pts = []
+                for e in edges:
+                    for v in e.Vertices():
+                        p = v.toTuple()
+                        pts.append([round(p[0], 3), round(p[1], 3), round(p[2], 3)])
+                # Controleer of dit een echte binnencontour is (geen buitenrand)
+                if len(pts) >= 3:
+                    cx = sum(p[0] for p in pts) / len(pts)
+                    cy = sum(p[1] for p in pts) / len(pts)
+                    cz = sum(p[2] for p in pts) / len(pts)
+                    contours.append({
+                        "id": len(contours) + 1,
+                        "face_id": face_id,
+                        "points": pts,
+                        "center": [round(cx, 3), round(cy, 3), round(cz, 3)]
+                    })
+        except Exception:
+            continue
+    print(f"✅ Found {len(contours)} inner contours")
+    return contours
 
-def detect_analytic_holes_strict(shape,
-                                 d_min=1.0, d_max=1000.0,
-                                 xy_tol=0.4, d_tol=0.4,
-                                 z_pair_min=0.2, z_pair_max=300.0,
-                                 full_circle_tol_ratio=0.04):
-    """
-    Verbeterde detectie van ronde doorlopende gaten.
-    ✅ Detecteert nu ook grote gaten (tot 1000 mm)
-    ✅ Negeert buitencontouren en halve cirkels
-    ✅ Herkent gaten door dikkere platen
-    ✅ Combineert boven/onderzijde tot één gat
-    """
-
+# -------------------------------
+# 🕳️ Strikte ronde gaten (optioneel)
+# -------------------------------
+def detect_analytic_holes_strict(shape, d_min=1.0, d_max=1000.0):
     circles = []
     for face in shape.Faces():
         for edge in face.Edges():
@@ -71,70 +91,20 @@ def detect_analytic_holes_strict(shape,
                 r = float(circ.Radius())
                 if r <= 0:
                     continue
-
-                # Controle: is dit een volledige cirkel (geen boog)?
-                L = float(edge.Length())
-                full_L = 2.0 * math.pi * r
-                if abs(L - full_L) > full_circle_tol_ratio * full_L:
-                    continue
-
-                # Coördinaten
                 cx, cy, cz = float(loc.X()), float(loc.Y()), float(loc.Z())
                 d = 2.0 * r
-
                 if not (d_min <= d <= d_max):
                     continue
-
-                circles.append((round(cx, 3), round(cy, 3), round(cz, 3), round(d, 3)))
+                circles.append({
+                    "x": round(cx, 3),
+                    "y": round(cy, 3),
+                    "z": round(cz, 3),
+                    "diameter": round(d, 3)
+                })
             except Exception:
                 continue
-
-    if not circles:
-        print("🕳️ No circular edges found.")
-        return []
-
-    # Groepeer op XY + diameter
-    groups = []
-    for cx, cy, cz, d in circles:
-        matched = False
-        for g in groups:
-            if (abs(g["x"] - cx) <= xy_tol and
-                abs(g["y"] - cy) <= xy_tol and
-                abs(g["d"] - d) <= d_tol):
-                g["zs"].append(cz)
-                matched = True
-                break
-        if not matched:
-            groups.append({"x": cx, "y": cy, "d": d, "zs": [cz]})
-
-    holes = []
-    for g in groups:
-        zs = sorted(g["zs"])
-        if len(zs) < 2:
-            continue
-        # Check paren van boven en onderzijde
-        for i in range(len(zs) - 1):
-            dz = abs(zs[i + 1] - zs[i])
-            if z_pair_min <= dz <= z_pair_max:
-                z_avg = round((zs[i] + zs[i + 1]) / 2.0, 3)
-                holes.append({
-                    "x": round(g["x"], 3),
-                    "y": round(g["y"], 3),
-                    "z": z_avg,
-                    "diameter": round(g["d"], 3)
-                })
-                break
-
-    # Duplicaten weghalen
-    deduped = []
-    for h in holes:
-        if not any(abs(h["x"] - u["x"]) <= xy_tol and
-                   abs(h["y"] - u["y"]) <= xy_tol and
-                   abs(h["diameter"] - u["diameter"]) <= d_tol for u in deduped):
-            deduped.append(h)
-
-    print(f"🕳️ Detected {len(deduped)} through-holes (range 1–1000 mm).")
-    return deduped
+    print(f"🕳️ Detected {len(circles)} round holes (analytic).")
+    return circles
 
 # -------------------------------
 # 📦 Upload helper
@@ -146,7 +116,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
     remote_path = f"analyzed/{remote_name}"
     storage = supabase.storage.from_(bucket)
     try:
-        # verwijder oud bestand
+        # Verwijder oud bestand
         try:
             files = storage.list(path="analyzed")
             for f in files:
@@ -173,7 +143,7 @@ def upload_to_supabase(local_path: str, remote_name: str) -> str:
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer live ✅ (v1.7.0 strict holes + STL export)"}
+    return {"message": "STEP analyzer live ✅ (v1.8.0 - innerContours + STL export)"}
 
 @app.get("/health")
 def health():
@@ -219,11 +189,12 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # 4️⃣ Hole detection
+        # 4️⃣ Detecties
+        inner_contours = extract_inner_contours(shape)
         holes = detect_analytic_holes_strict(shape)
         holes_detected = len(holes)
 
-        # 5️⃣ STL exporteren
+        # 5️⃣ STL export
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
@@ -234,14 +205,13 @@ async def analyze_step(file: UploadFile = File(...)):
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
-                "dimensions": {"x": dims["X"], "y": dims["Y"], "z": dims["Z"]},
                 "holes_detected": holes_detected,
                 "holes_data": holes,
-                "created_at": "now()",
-                "units": "mm",
+                "inner_contours": inner_contours,
                 "bounding_box_x": dims["X"],
                 "bounding_box_y": dims["Y"],
                 "bounding_box_z": dims["Z"],
+                "volume_mm3": volume_mm3,
                 "model_url": stl_public_url,
             }).execute()
 
@@ -254,6 +224,7 @@ async def analyze_step(file: UploadFile = File(...)):
             "filename": file.filename,
             "holesDetected": holes_detected,
             "holes": holes,
+            "innerContours": inner_contours,
             "modelURL": stl_public_url,
         })
 
