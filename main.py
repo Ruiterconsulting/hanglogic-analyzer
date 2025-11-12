@@ -1,22 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 import cadquery as cq
 from cadquery import exporters
-import tempfile
-import os
-import math
-import traceback
-from supabase import create_client, Client
-import httpx
-import trimesh
-import uuid
+import tempfile, os, math, traceback, uuid
 from datetime import datetime
+from supabase import create_client, Client
+import trimesh
 
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.2")
+app = FastAPI(title="HangLogic Analyzer API", version="2.2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +70,7 @@ def detect_analytic_holes_strict(shape, d_min=2.0, d_max=30.0,
     if not circles:
         return []
 
-    groups = []
+    groups, holes = [], []
     for cx, cy, cz, d in circles:
         placed = False
         for g in groups:
@@ -88,7 +83,6 @@ def detect_analytic_holes_strict(shape, d_min=2.0, d_max=30.0,
         if not placed:
             groups.append({"x": cx, "y": cy, "d": d, "zs": [cz]})
 
-    holes = []
     for g in groups:
         zs = sorted(g["zs"])
         if len(zs) < 2:
@@ -135,6 +129,7 @@ async def analyze_step(file: UploadFile = File(...)):
         ext = (os.path.splitext(file.filename)[1] or "").lower()
         if ext not in [".step", ".stp"]:
             raise HTTPException(status_code=415, detail="Please upload .STEP or .STP file")
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
@@ -160,35 +155,46 @@ async def analyze_step(file: UploadFile = File(...)):
         scene = trimesh.Scene()
         scene.add_geometry(mesh, node_name="body")
 
-        # 🌈 Face-gebaseerde opvulling
+        # 🌈 Face-gebaseerde vulling
+        filled_solids = []
         for f_idx, face in enumerate(shape.Faces()):
             try:
                 outer = face.outerWire()
             except Exception:
                 outer = None
+
             for w_idx, wire in enumerate(face.Wires()):
                 if outer and wire.isSame(outer):
                     continue
                 try:
                     center = face.Center()
-                    normal = face.normalAt(0.5, 0.5)
+                    try:
+                        normal = face.normalAt()
+                    except Exception:
+                        normal = cq.Vector(0, 0, 1)
+
                     origin = (center.x, center.y, center.z)
                     direction = (normal.x, normal.y, normal.z)
                     plane = cq.Workplane(cq.Plane(origin, direction))
                     wire_2d = plane.add(wire)
-                    extrusion_depth = bbox.zlen * 0.99 * (1 if normal.z >= 0 else -1)
-                    solid = wire_2d.toPending().extrude(extrusion_depth)
-                    tmp_fill = tempfile.NamedTemporaryFile(delete=False, suffix=".stl")
-                    exporters.export(solid, tmp_fill.name, "STL")
-                    filled = trimesh.load_mesh(tmp_fill.name)
-                    filled.visual.vertex_colors = [green] * len(filled.vertices)
-                    scene.add_geometry(filled, node_name=f"fill_{f_idx}_{w_idx}")
-                    tmp_fill.close()
-                    os.remove(tmp_fill.name)
+
+                    depth = bbox.zlen * 0.5
+                    solid_pos = wire_2d.toPending().extrude(depth)
+                    solid_neg = wire_2d.toPending().extrude(-depth)
+                    solid = solid_pos.union(solid_neg)
+                    filled_solids.append(solid)
+
                 except Exception as e:
                     print(f"⚠️ Fill failed on face {f_idx}: {e}")
 
-        glb_bytes = scene.export(file_type="glb")
+        # Combineer originele shape + vullingen
+        if filled_solids:
+            combined = cq.Workplane("XY").newObject([shape])
+            for s in filled_solids:
+                combined = combined.union(s)
+            cq.exporters.export(combined, stl_path, "STL")
+
+        glb_bytes = trimesh.load_mesh(stl_path).scene().export(file_type="glb")
         glb_path = tmp_path.replace(".step", ".glb")
         with open(glb_path, "wb") as f:
             f.write(glb_bytes)
