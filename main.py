@@ -16,7 +16,7 @@ from datetime import datetime
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.0")
+app = FastAPI(title="HangLogic Analyzer API", version="2.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,7 +153,7 @@ def _ensure_step_extension(filename: str):
 # -------------------------------
 @app.get("/")
 def root():
-    return {"message": "STEP analyzer ✅ (v2.2.0) — GLB + full-thickness contour fill"}
+    return {"message": "STEP analyzer ✅ (v2.2.1) — full-thickness face-based contour fill"}
 
 @app.get("/health")
 def health():
@@ -185,7 +185,7 @@ async def analyze_step(file: UploadFile = File(...)):
         }
         volume = float(shape.Volume()) if shape.Volume() else None
 
-        # Detectie ronde gaten (voor rapportage)
+        # Detectie ronde gaten (info)
         strict_holes = detect_analytic_holes_strict(shape)
 
         # STL export
@@ -203,7 +203,7 @@ async def analyze_step(file: UploadFile = File(...)):
         scene = trimesh.Scene()
         scene.add_geometry(mesh, node_name="body")
 
-        # Voeg exacte contourvullingen toe — over volledige plaatdikte
+        # Voeg exacte contourvullingen toe met face-based plane
         for f_idx, face in enumerate(shape.Faces()):
             try:
                 outer = face.outerWire()
@@ -215,14 +215,24 @@ async def analyze_step(file: UploadFile = File(...)):
                     continue
                 try:
                     normal = face.normalAt(0.5, 0.5)
-                    # Vul volledige plaatdikte (99% van totale Z-lengte)
                     extrusion_depth = bbox.zlen * 0.99 * (1 if normal.z >= 0 else -1)
-                    solid = cq.Workplane().add(wire).toPending().extrude(extrusion_depth)
+
+                    # Gebruik de lokale werkplane van de face
+                    try:
+                        plane = cq.Workplane(face)
+                    except Exception:
+                        plane = cq.Workplane("XY")
+
+                    wire_2d = cq.Workplane(plane).add(wire)
+                    solid = wire_2d.toPending().extrude(extrusion_depth)
+
                     tmp_fill = tempfile.NamedTemporaryFile(delete=False, suffix=".stl")
                     exporters.export(solid, tmp_fill.name, "STL")
+
                     filled = trimesh.load_mesh(tmp_fill.name)
                     filled.visual.vertex_colors = [green] * len(filled.vertices)
                     scene.add_geometry(filled, node_name=f"fill_{f_idx}_{w_idx}")
+
                     tmp_fill.close()
                     os.remove(tmp_fill.name)
                 except Exception as e:
