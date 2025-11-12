@@ -175,9 +175,9 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_path = tmp_path.replace(".step", ".stl")
         cq.exporters.export(shape, stl_path, "STL")
 
-        # 📤 Exporteer GLB (met kleuren)
+        # 📤 Exporteer GLB (met kleuren) via Assembly.toGlTF()
         glb_path = tmp_path.replace(".step", ".glb")
-        cq.exporters.export(asm, glb_path, "GLB")
+        asm.save(glb_path, exportType="GLTF")
 
         # ☁️ Uploaden
         stl_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
