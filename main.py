@@ -11,7 +11,7 @@ import trimesh
 # -------------------------------
 # 🌍 App configuratie
 # -------------------------------
-app = FastAPI(title="HangLogic Analyzer API", version="2.2.4")
+app = FastAPI(title="HangLogic Analyzer API", version="2.2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -148,14 +148,14 @@ async def analyze_step(file: UploadFile = File(...)):
         exporters.export(shape, stl_path, "STL")
         stl_url = upload_to_supabase(stl_path, f"{base_name}.stl")
 
-        green = [0, 255, 0, 255]
         light_blue = [150, 200, 255, 255]
+        green = [0, 255, 0, 255]
         mesh = trimesh.load_mesh(stl_path)
         mesh.visual.vertex_colors = [light_blue] * len(mesh.vertices)
         scene = trimesh.Scene()
         scene.add_geometry(mesh, node_name="body")
 
-        # 🌈 Face-gebaseerde vulling
+        # 🌈 Vullingen van binnencontouren
         filled_solids = []
         for f_idx, face in enumerate(shape.Faces()):
             try:
@@ -178,6 +178,7 @@ async def analyze_step(file: UploadFile = File(...)):
                     plane = cq.Workplane(cq.Plane(origin, direction))
                     wire_2d = plane.add(wire)
 
+                    # Extrude over volledige dikte van de plaat
                     depth = bbox.zlen * 0.5
                     solid_pos = wire_2d.toPending().extrude(depth)
                     solid_neg = wire_2d.toPending().extrude(-depth)
@@ -187,14 +188,21 @@ async def analyze_step(file: UploadFile = File(...)):
                 except Exception as e:
                     print(f"⚠️ Fill failed on face {f_idx}: {e}")
 
-        # Combineer originele shape + vullingen
-        if filled_solids:
-            combined = cq.Workplane("XY").newObject([shape])
-            for s in filled_solids:
-                combined = combined.union(s)
-            cq.exporters.export(combined, stl_path, "STL")
+        # ✅ Voeg elke vulling apart toe aan de scene (groen)
+        for s_idx, solid in enumerate(filled_solids):
+            try:
+                tmp_fill = tempfile.NamedTemporaryFile(delete=False, suffix=".stl")
+                exporters.export(solid, tmp_fill.name, "STL")
+                fill_mesh = trimesh.load_mesh(tmp_fill.name)
+                fill_mesh.visual.vertex_colors = [green] * len(fill_mesh.vertices)
+                scene.add_geometry(fill_mesh, node_name=f"fill_{s_idx}")
+                tmp_fill.close()
+                os.remove(tmp_fill.name)
+            except Exception as e:
+                print(f"⚠️ Failed to add fill solid {s_idx}: {e}")
 
-        glb_bytes = trimesh.load_mesh(stl_path).scene().export(file_type="glb")
+        # Export GLB
+        glb_bytes = scene.export(file_type="glb")
         glb_path = tmp_path.replace(".step", ".glb")
         with open(glb_path, "wb") as f:
             f.write(glb_bytes)
