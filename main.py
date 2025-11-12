@@ -150,8 +150,27 @@ async def analyze_step(file: UploadFile = File(...)):
         # 🟢 Detect binnencontouren
         inner_contours = detect_inner_contours(shape)
 
-        # 🎨 Maak blauw basismodel
-        blue_model = cq.Workplane("XY").add(shape).setColor(cq.Color(0, 0, 1))  # blauw
+        # 🎨 Maak blauw basismodel via Assembly (ondersteunt kleur in GLB)
+asm = cq.Assembly()
+asm.add(shape, color=cq.Color(0, 0, 1))  # blauw
+
+# 🟢 Voeg groene patches toe (zichtbare binnencontouren)
+for contour in inner_contours:
+    try:
+        pts = contour["points"]
+        if not pts or len(pts) < 3:
+            continue
+        avg_z = sum(p[2] for p in pts) / len(pts)
+        projected_pts = [cq.Vector(p[0], p[1], avg_z + 0.1) for p in pts]
+
+        if projected_pts[0] != projected_pts[-1]:
+            projected_pts.append(projected_pts[0])
+
+        wire = cq.Wire.makePolygon(projected_pts)
+        face = cq.Face.makeFromWires(wire)
+        asm.add(face, color=cq.Color(0, 1, 0))  # groen
+    except Exception as e:
+        print(f"⚠️ Failed to create green patch for contour {contour.get('id', '?')}: {e}")
 
         # 🟢 Voeg groene patches toe (zichtbare binnencontouren)
         for contour in inner_contours:
@@ -177,7 +196,7 @@ async def analyze_step(file: UploadFile = File(...)):
 
         # 📤 Exporteer GLB (met kleuren)
         glb_path = tmp_path.replace(".step", ".glb")
-        cq.exporters.export(blue_model, glb_path, "GLTF")
+        cq.exporters.export(asm, glb_path, "GLTF")
 
         # ☁️ Uploaden
         stl_url = upload_to_supabase(stl_path, file.filename.replace(".step", ".stl"))
