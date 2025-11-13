@@ -17,7 +17,7 @@ from OCP.ShapeFix import ShapeFix_Wire
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.3.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +50,7 @@ else:
 def upload_unique(local_path: str, original_name: str) -> str | None:
     """
     Upload file to Supabase met unieke naam.
-    Geeft public URL terug of None als supabase niet beschikbaar is.
+    Geeft public URL of None als Supabase niet beschikbaar is.
     """
     if not supabase:
         print("⚠️ Supabase not configured, skipping upload for", original_name)
@@ -83,8 +83,7 @@ def ensure_step(filename: str):
 
 def make_bbox_dims(bbox) -> dict:
     """
-    Zelfde logica als eerder:
-    sorteer de drie afmetingen, grootste = X, middelste = Y, kleinste = Z.
+    Sorteer de drie afmetingen: grootste = X, middelste = Y, kleinste = Z.
     """
     raw = [float(bbox.xlen), float(bbox.ylen), float(bbox.zlen)]
     sorted_dims = sorted(raw, reverse=True)
@@ -97,7 +96,7 @@ def make_bbox_dims(bbox) -> dict:
 
 def safe_error_payload(filename: str | None, message: str, trace: str):
     """
-    Zodat Lovable / Postman ALTIJD nette JSON krijgt, ook bij fout.
+    Zodat je in Postman / Lovable ALTIJD nette JSON terugkrijgt.
     """
     return {
         "status": "error",
@@ -115,7 +114,7 @@ def safe_error_payload(filename: str | None, message: str, trace: str):
 
 
 # =====================================================
-# Geometry helpers: binnencontouren
+# Geometry helpers
 # =====================================================
 
 def repair_wire(wire):
@@ -141,67 +140,72 @@ def repair_wire(wire):
 
 def detect_inner_wires(shape):
     """
-    Zoek ALLE gesloten binnencontouren op faces:
-
-    - we checken niet meer op isPlane(), om niets te missen
-    - grootste wire (op basis van area) = outer
-    - alle andere gesloten wires = inner
+    Gebruik face.innerWires() als CadQuery dat ondersteunt.
+    Zo niet, val terug op de area-truc.
 
     Retourneert: lijst van (face_index, face, [inner_wires])
     """
     result = []
-    face_count = 0
+    faces_checked = 0
 
     for f_idx, face in enumerate(shape.Faces()):
-        face_count += 1
-        wires = list(face.Wires())
-        if len(wires) <= 1:
-            continue
+        faces_checked += 1
 
-        areas = []
-        for w in wires:
-            try:
-                fw = cq.Face.makeFromWires(w)
-                areas.append(abs(float(fw.Area())))
-            except Exception:
-                areas.append(0.0)
+        inners = []
+        try:
+            # Nieuwere CadQuery: face.innerWires()
+            if hasattr(face, "innerWires"):
+                inners = list(face.innerWires())
+        except Exception as e:
+            print(f"⚠️ face.innerWires() failed on face {f_idx}: {e}")
+            inners = []
 
-        if not areas:
-            continue
-
-        outer_idx = max(range(len(areas)), key=lambda i: areas[i])
-
-        inner = []
-        for i, w in enumerate(wires):
-            if i == outer_idx:
+        if not inners:
+            # Fallback: grootste wire = outer, rest = inner
+            wires = list(face.Wires())
+            if len(wires) <= 1:
                 continue
 
-            try:
-                if w.isNull():
-                    continue
-                if hasattr(w, "isClosed") and not w.isClosed():
-                    continue
-                if len(w.Edges()) == 0:
-                    continue
-            except Exception:
+            areas = []
+            for w in wires:
+                try:
+                    fw = cq.Face.makeFromWires(w)
+                    areas.append(abs(float(fw.Area())))
+                except Exception:
+                    areas.append(0.0)
+
+            if not areas:
                 continue
 
-            inner.append(w)
+            outer_idx = max(range(len(areas)), key=lambda i: areas[i])
+            for i, w in enumerate(wires):
+                if i == outer_idx:
+                    continue
+                try:
+                    if w.isNull():
+                        continue
+                    if hasattr(w, "isClosed") and not w.isClosed():
+                        continue
+                    if len(w.Edges()) == 0:
+                        continue
+                except Exception:
+                    continue
+                inners.append(w)
 
-        if inner:
-            result.append((f_idx, face, inner))
+        if inners:
+            result.append((f_idx, face, inners))
 
-    print(f"🔍 Faces checked: {face_count}, faces with inner wires: {len(result)}")
+    print(f"🔍 Faces checked: {faces_checked}, faces with inner wires: {len(result)}")
     return result
 
 
 def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     """
-    Maak een 'plug' die het gat vult:
+    Bouw een groen solid die het gat opvult:
 
     - wire repareren
-    - plane = exacte face-plane
-    - extrude in normaalrichting over (minstens) plaatdikte
+    - Workplane op de face (CadQuery regelt zelf de juiste oriëntatie)
+    - extrude over de plaatdikte
     """
     wire = repair_wire(wire)
 
@@ -213,17 +217,8 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
         return None
 
     try:
-        # Plane van face (werkt voor vlakke faces; voor andere kan het falen)
-        plane = face.toPln()
-    except Exception as e:
-        print(f"⚠️ face.toPln failed on face {f_idx}: {e}")
-        return None
-
-    try:
-        wp = cq.Workplane(plane).add(wire)
+        wp = cq.Workplane(face).add(wire)
         depth = thickness if thickness > 0 else 1.0
-
-        # Extrude één kant op (positieve normaal)
         solid = wp.toPending().extrude(depth)
         return solid
     except Exception as e:
@@ -237,7 +232,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.3.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.4.0)"}
 
 
 @app.post("/analyze")
@@ -248,7 +243,7 @@ async def analyze_step(file: UploadFile = File(...)):
     try:
         ensure_step(filename)
 
-        # 1️⃣ STEP file tijdelijk opslaan
+        # 1️⃣ STEP tijdelijk opslaan
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
@@ -268,8 +263,10 @@ async def analyze_step(file: UploadFile = File(...)):
         raw_thickness = min(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
         thickness = raw_thickness if raw_thickness > 0 else 1.0
 
-        print(f"📏 BoundingBox raw: ({bbox.xlen}, {bbox.ylen}, {bbox.zlen}), "
-              f"sorted dims = {dims}, thickness ≈ {thickness}")
+        print(
+            f"📏 BoundingBox raw: ({bbox.xlen}, {bbox.ylen}, {bbox.zlen}), "
+            f"sorted dims = {dims}, thickness ≈ {thickness}"
+        )
 
         # 4️⃣ Volume
         try:
@@ -277,7 +274,7 @@ async def analyze_step(file: UploadFile = File(...)):
         except Exception:
             volume_mm3 = None
 
-        # 5️⃣ Binnencontouren detecteren en vullen
+        # 5️⃣ Binnencontouren detecteren en fills bouwen
         inner_faces = detect_inner_wires(shape)
         fills = []
 
@@ -303,7 +300,7 @@ async def analyze_step(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"⚠️ Assembly add failed for fill_{idx}: {e}")
 
-        # 7️⃣ GLB export – nieuwe API + fallback
+        # 7️⃣ GLB export – probeer nieuwe API, anders fallback
         tmp_glb = tmp_step.replace(".step", ".glb")
 
         try:
@@ -325,7 +322,7 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_url = upload_unique(tmp_stl, filename.replace(".step", ".stl")) if tmp_stl else None
         glb_url = upload_unique(tmp_glb, filename.replace(".step", ".glb")) if tmp_glb else None
 
-        # 🔟 Wegschrijven in DB
+        # 🔟 Wegschrijven in DB (best effort)
         if supabase:
             try:
                 supabase.table("analyzed_parts").insert({
