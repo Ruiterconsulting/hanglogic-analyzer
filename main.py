@@ -17,7 +17,7 @@ from OCP.ShapeFix import ShapeFix_Wire
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.4.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -140,8 +140,10 @@ def repair_wire(wire):
 
 def detect_inner_wires(shape):
     """
-    Gebruik face.innerWires() als CadQuery dat ondersteunt.
-    Zo niet, val terug op de area-truc.
+    Zoek ALLE gesloten binnencontouren op faces:
+
+    - gebruik face.innerWires() als CadQuery dat ondersteunt
+    - fallback: grootste wire = outer, rest = inner
 
     Retourneert: lijst van (face_index, face, [inner_wires])
     """
@@ -153,7 +155,6 @@ def detect_inner_wires(shape):
 
         inners = []
         try:
-            # Nieuwere CadQuery: face.innerWires()
             if hasattr(face, "innerWires"):
                 inners = list(face.innerWires())
         except Exception as e:
@@ -161,7 +162,7 @@ def detect_inner_wires(shape):
             inners = []
 
         if not inners:
-            # Fallback: grootste wire = outer, rest = inner
+            # fallback
             wires = list(face.Wires())
             if len(wires) <= 1:
                 continue
@@ -204,8 +205,8 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     Bouw een groen solid die het gat opvult:
 
     - wire repareren
-    - Workplane op de face (CadQuery regelt zelf de juiste oriëntatie)
-    - extrude over de plaatdikte
+    - Workplane op de face (CadQuery regelt zelf de oriëntatie)
+    - extrude één kant op (naar binnen) over ongeveer de plaatdikte
     """
     wire = repair_wire(wire)
 
@@ -218,8 +219,10 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
     try:
         wp = cq.Workplane(face).add(wire)
-        depth = thickness if thickness > 0 else 1.0
-        solid = wp.toPending().extrude(depth)
+        # ietsje langer dan de dikte zodat hij zeker door de plaat heen gaat
+        depth = max(thickness, 1.0) * 1.05
+        # negatieve extrude = naar binnen t.o.v. de face-normal
+        solid = wp.toPending().extrude(-depth)
         return solid
     except Exception as e:
         print(f"⚠️ Fill extrude failed on face {f_idx}, wire {w_idx}: {e}")
@@ -232,7 +235,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.4.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.5.0)"}
 
 
 @app.post("/analyze")
@@ -278,8 +281,22 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_wires(shape)
         fills = []
 
+        # dedupe: per gat maar één fill (op basis van wire center)
+        seen_centers = set()
+
         for f_idx, face, wires in inner_faces:
             for w_idx, wire in enumerate(wires):
+                try:
+                    c = wire.Center()
+                except Exception:
+                    c = face.Center()
+
+                key = (round(c.x, 2), round(c.y, 2), round(c.z, 2))
+                if key in seen_centers:
+                    # dit gat hebben we al gevuld vanaf de andere zijde
+                    continue
+                seen_centers.add(key)
+
                 solid = build_fill_from_wire(face, wire, thickness, f_idx, w_idx)
                 if solid is not None:
                     fills.append(solid)
