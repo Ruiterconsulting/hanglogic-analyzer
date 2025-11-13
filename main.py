@@ -17,7 +17,7 @@ from OCP.ShapeFix import ShapeFix_Wire
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.2.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,26 +139,21 @@ def repair_wire(wire):
     return wire
 
 
-def detect_inner_wires_planar(shape):
+def detect_inner_wires(shape):
     """
-    Zoek ALLE gesloten binnencontouren op vlakke faces:
+    Zoek ALLE gesloten binnencontouren op faces:
 
-    - alleen planar faces
+    - we checken niet meer op isPlane(), om niets te missen
     - grootste wire (op basis van area) = outer
     - alle andere gesloten wires = inner
 
     Retourneert: lijst van (face_index, face, [inner_wires])
     """
     result = []
+    face_count = 0
 
     for f_idx, face in enumerate(shape.Faces()):
-        # Alleen vlakke vlakken
-        try:
-            if not face.isPlane():
-                continue
-        except Exception:
-            continue
-
+        face_count += 1
         wires = list(face.Wires())
         if len(wires) <= 1:
             continue
@@ -174,7 +169,6 @@ def detect_inner_wires_planar(shape):
         if not areas:
             continue
 
-        # grootste = outer
         outer_idx = max(range(len(areas)), key=lambda i: areas[i])
 
         inner = []
@@ -185,7 +179,6 @@ def detect_inner_wires_planar(shape):
             try:
                 if w.isNull():
                     continue
-                # alleen gesloten contouren
                 if hasattr(w, "isClosed") and not w.isClosed():
                     continue
                 if len(w.Edges()) == 0:
@@ -198,7 +191,7 @@ def detect_inner_wires_planar(shape):
         if inner:
             result.append((f_idx, face, inner))
 
-    print(f"🟢 Planar faces with inner wires: {len(result)}")
+    print(f"🔍 Faces checked: {face_count}, faces with inner wires: {len(result)}")
     return result
 
 
@@ -209,9 +202,6 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     - wire repareren
     - plane = exacte face-plane
     - extrude in normaalrichting over (minstens) plaatdikte
-
-    Let op: we extruden 1 richting; voor een plaatdeel is dat in de praktijk genoeg
-    om het gat visueel volledig te vullen.
     """
     wire = repair_wire(wire)
 
@@ -223,7 +213,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
         return None
 
     try:
-        # Exacte vlakke plane van de face
+        # Plane van face (werkt voor vlakke faces; voor andere kan het falen)
         plane = face.toPln()
     except Exception as e:
         print(f"⚠️ face.toPln failed on face {f_idx}: {e}")
@@ -232,8 +222,9 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     try:
         wp = cq.Workplane(plane).add(wire)
         depth = thickness if thickness > 0 else 1.0
-        solid = wp.toPending().extrude(depth)
 
+        # Extrude één kant op (positieve normaal)
+        solid = wp.toPending().extrude(depth)
         return solid
     except Exception as e:
         print(f"⚠️ Fill extrude failed on face {f_idx}, wire {w_idx}: {e}")
@@ -246,7 +237,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.2.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.3.0)"}
 
 
 @app.post("/analyze")
@@ -267,7 +258,6 @@ async def analyze_step(file: UploadFile = File(...)):
         shape = model.val()
         print(f"🧠 Analyzing: {filename}")
 
-        # Als shape toch null is → nette error terug
         if shape is None or shape.isNull():
             raise RuntimeError("Imported STEP shape is null")
 
@@ -275,7 +265,6 @@ async def analyze_step(file: UploadFile = File(...)):
         bbox = shape.BoundingBox()
         dims = make_bbox_dims(bbox)
 
-        # dikte = kleinste originele afmeting
         raw_thickness = min(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
         thickness = raw_thickness if raw_thickness > 0 else 1.0
 
@@ -289,7 +278,7 @@ async def analyze_step(file: UploadFile = File(...)):
             volume_mm3 = None
 
         # 5️⃣ Binnencontouren detecteren en vullen
-        inner_faces = detect_inner_wires_planar(shape)
+        inner_faces = detect_inner_wires(shape)
         fills = []
 
         for f_idx, face, wires in inner_faces:
@@ -302,8 +291,8 @@ async def analyze_step(file: UploadFile = File(...)):
         print(f"🟢 Built {holes_detected} fill solids")
 
         # 6️⃣ Assembly bouwen met kleuren
-        base_color = Color(0.6, 0.8, 1.0, 1.0)   # lichtblauw (RGBA)
-        fill_color = Color(0.0, 1.0, 0.0, 1.0)   # felgroen (RGBA)
+        base_color = Color(0.6, 0.8, 1.0, 1.0)   # lichtblauw
+        fill_color = Color(0.0, 1.0, 0.0, 1.0)   # felgroen
 
         asm = cq.Assembly()
         asm.add(shape, name="base", color=base_color)
@@ -314,23 +303,20 @@ async def analyze_step(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"⚠️ Assembly add failed for fill_{idx}: {e}")
 
-        # 7️⃣ GLTF/GLB export – officiële CadQuery API met fallback
+        # 7️⃣ GLB export – nieuwe API + fallback
         tmp_glb = tmp_step.replace(".step", ".glb")
 
         try:
-            # Nieuwe API: Assembly.export naar GLTF
             asm.export(tmp_glb, "GLTF")
             print("✅ GLB exported via Assembly.export")
         except AttributeError:
-            # Oudere API: Assembly.save(...)
             asm.save(tmp_glb, exportType="GLTF")
             print("✅ GLB exported via Assembly.save (fallback)")
         except Exception as e:
             print("⚠️ GLB export failed:", e)
-            # We laten de analyse verder wel doorgaan; modelURL_GLB kan dan None zijn
             tmp_glb = None
 
-        # 8️⃣ STL export (basisdeel, zonder kleuren)
+        # 8️⃣ STL export (basisdeel)
         tmp_stl = tmp_step.replace(".step", ".stl")
         cq.exporters.export(shape, tmp_stl, "STL")
         print("✅ STL exported")
@@ -339,7 +325,7 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_url = upload_unique(tmp_stl, filename.replace(".step", ".stl")) if tmp_stl else None
         glb_url = upload_unique(tmp_glb, filename.replace(".step", ".glb")) if tmp_glb else None
 
-        # 1️⃣0️⃣ Wegschrijven in DB
+        # 🔟 Wegschrijven in DB
         if supabase:
             try:
                 supabase.table("analyzed_parts").insert({
@@ -365,7 +351,7 @@ async def analyze_step(file: UploadFile = File(...)):
             "volumeMM3": round(volume_mm3, 3) if volume_mm3 is not None else None,
             "filename": filename,
             "holesDetected": holes_detected,
-            "holes": [],              # eventueel later vullen met data per contour
+            "holes": [],
             "modelURL": stl_url,
             "modelURL_GLB": glb_url,
         }
