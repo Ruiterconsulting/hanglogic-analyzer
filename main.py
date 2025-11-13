@@ -18,7 +18,7 @@ from OCP.ShapeFix import ShapeFix_Wire
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="3.5.0")
+app = FastAPI(title="HangLogic Analyzer API", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,11 +63,45 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
 
 
 # =====================================================
-# Utility: Wire Repair
+# JSON helpers — belangrijkste fix voor Lovable
+# =====================================================
+
+def safe_response_success(filename, dims, stl_url, glb_url, filled):
+    """Altijd hoofdletters X/Y/Z om Lovable crashes te voorkomen."""
+    return {
+        "status": "success",
+        "filename": filename,
+        "dimensions": {
+            "X": dims["X"],
+            "Y": dims["Y"],
+            "Z": dims["Z"],
+        },
+        "filledContours": filled,
+        "modelURL": stl_url,
+        "modelURL_GLB": glb_url,
+    }
+
+
+def safe_response_error(message, trace=""):
+    """Ook bij errors nooit undefined dimensions → voorkomt frontend crash."""
+    return {
+        "status": "error",
+        "filename": None,
+        "dimensions": {"X": 0, "Y": 0, "Z": 0},
+        "filledContours": 0,
+        "modelURL": None,
+        "modelURL_GLB": None,
+        "message": message,
+        "trace": trace,
+    }
+
+
+# =====================================================
+# Wire Repair
 # =====================================================
 
 def repair_wire(wire):
-    """Forcefully repair and close problematic STEP wires."""
+    """Hard-fixes STEP wires."""
     try:
         fixer = ShapeFix_Wire(wire)
         fixer.ClosedWireMode()
@@ -77,245 +111,105 @@ def repair_wire(wire):
         fixer.SetPrecision(1e-6)
         fixed = fixer.Wire()
         return fixed if not fixed.IsNull() else wire
-    except Exception as e:
-        print("⚠️ ShapeFix_Wire failed:", e)
+    except:
         return wire
 
 
 # =====================================================
-# Utility: Detect inner wires (gesloten binnencontouren op vlakke faces)
+# Detect **gesloten** binnencontouren (alleen vlakke faces)
 # =====================================================
 
 def detect_inner_wires(shape):
     """
-    Detect gesloten binnencontouren (alleen planar faces).
-    Returns list of (face_index, cq.Face, [cq.Wire, ...])
+    Detecteert A-type gaten:
+    - alleen vlakke faces
+    - grootste wire = outer
+    - smallere wires = binnencontouren (gaten)
     """
-    data = []
+    cleaned = []
 
     for f_idx, face in enumerate(shape.Faces()):
         try:
             if not face.isPlane():
-                continue  # geen extrude op gebogen faces
-        except Exception:
+                continue
+        except:
             continue
 
         wires = list(face.Wires())
-        if not wires:
+        if len(wires) <= 1:
             continue
 
-        try:
-            outer = face.outerWire()
-        except Exception:
-            outer = wires[0]
-
-        inner_wires = []
+        # Compute wire area to detect outer
+        areas = []
         for w in wires:
+            try:
+                fw = cq.Face.makeFromWires(w)
+                areas.append(abs(fw.Area()))
+            except:
+                areas.append(0)
+
+        outer_index = max(range(len(areas)), key=lambda i: areas[i])
+
+        inner = []
+        for i, w in enumerate(wires):
+            if i == outer_index:
+                continue
             try:
                 if w.isNull():
                     continue
-                # skip outer boundary
-                if w.isSame(outer):
+                if hasattr(w, "isClosed") and not w.isClosed():
                     continue
-                # alleen gesloten binnencontouren (optie A)
-                if hasattr(w, "isClosed"):
-                    closed = w.isClosed()
-                else:
-                    closed = True  # fallback
-                if not closed:
+                if len(w.Edges()) == 0:
                     continue
-                edges = w.Edges()
-                if len(edges) == 0:
-                    continue
-            except Exception:
+            except:
                 continue
+            inner.append(w)
 
-            inner_wires.append(w)
+        if inner:
+            cleaned.append((f_idx, face, inner))
 
-        if inner_wires:
-            data.append((f_idx, face, inner_wires))
-
-    print(f"🟢 Planar inner wires found on {len(data)} faces")
-    return data
+    print(f"🟢 Detected planar inner contours on {len(cleaned)} faces")
+    return cleaned
 
 
 # =====================================================
-# Utility: Fill from wire (general inner contour)
+# Fill a single closed contour
 # =====================================================
 
 def build_solid_from_wire(face, wire, thickness, f_idx, w_idx):
-    """
-    Extrudes a repaired wire along the local face normal.
-    Geschikt voor vlakke faces (plaat, flens, etc.).
-    """
+    """Extrudes inner contour exactly in both directions."""
     wire = repair_wire(wire)
 
     try:
         if wire.isNull() or wire.Length() < 0.1:
-            print(f"⚠️ Repaired wire on face {f_idx} still invalid")
             return None
-    except Exception:
+    except:
         return None
 
-    # Normaal van de face
     try:
         normal = face.normalAt()
-    except Exception:
+    except:
         normal = cq.Vector(0, 0, 1)
 
-    # Center van de wire
     try:
         center = wire.Center()
-    except Exception:
+    except:
         center = face.Center()
 
-    plane = cq.Plane((center.x, center.y, center.z), (normal.x, normal.y, normal.z))
+    plane = cq.Plane((center.x, center.y, center.z),
+                     (normal.x, normal.y, normal.z))
 
     try:
         wp = cq.Workplane(plane).add(wire)
 
-        # Symmetrisch extruderen door plaatdikte
-        depth = thickness
-        if depth <= 0:
-            return None
+        pos = wp.toPending().extrude(thickness / 2)
+        neg = wp.toPending().extrude(-thickness / 2)
 
-        pos = wp.toPending().extrude(depth / 2.0)
-        neg = wp.toPending().extrude(-depth / 2.0)
-        solid = pos.union(neg)
-        return solid
+        return pos.union(neg)
+
     except Exception as e:
-        print(f"⚠️ fill failed on face {f_idx}, wire {w_idx}: {e}")
+        print(f"⚠️ Fill failed on face {f_idx} wire {w_idx}: {e}")
         return None
-
-
-# =====================================================
-# Utility: Detect & fill circular through-holes (any face orientation)
-# =====================================================
-
-def detect_circular_hole_fills(shape, thickness_guess):
-    """
-    Detect analytic circular edges that form through-holes
-    and return cq.Solid cylinders that fill these holes.
-    """
-    circles = []
-
-    # 1️⃣ Verzamel alle volledige cirkel-edges
-    for face in shape.Faces():
-        for edge in face.Edges():
-            if edge.geomType() != "CIRCLE":
-                continue
-            try:
-                ga = edge._geomAdaptor()
-                circ = ga.Circle()
-                center = circ.Location()   # gp_Pnt
-                axis = circ.Axis()         # gp_Ax1
-                direction = axis.Direction()
-                r = float(circ.Radius())
-                if r <= 0:
-                    continue
-
-                # Check of edge ongeveer een volledige cirkel is
-                L = float(edge.Length())
-                full_L = 2.0 * math.pi * r
-                if abs(L - full_L) > 0.02 * full_L:
-                    continue
-
-                C = cq.Vector(center.X(), center.Y(), center.Z())
-                D = cq.Vector(direction.X(), direction.Y(), direction.Z())
-                if D.Length == 0:
-                    continue
-                D = D.normalized()
-
-                circles.append({"center": C, "dir": D, "r": r})
-            except Exception as e:
-                print("⚠️ circle extraction failed:", e)
-                continue
-
-    if not circles:
-        return []
-
-    used = set()
-    fills = []
-
-    def v_sub(a: cq.Vector, b: cq.Vector) -> cq.Vector:
-        return cq.Vector(a.x - b.x, a.y - b.y, a.z - b.z)
-
-    def v_scale(a: cq.Vector, s: float) -> cq.Vector:
-        return cq.Vector(a.x * s, a.y * s, a.z * s)
-
-    def v_len(a: cq.Vector) -> float:
-        return math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
-
-    # Verwachte gaten-diepte ligt rond materiaal-dikte
-    max_depth = thickness_guess * 3.0  # toleranties
-
-    for i in range(len(circles)):
-        if i in used:
-            continue
-        ci = circles[i]
-        best_j = None
-        best_depth = 0.0
-
-        for j in range(len(circles)):
-            if j == i or j in used:
-                continue
-            cj = circles[j]
-
-            # As moet ongeveer parallel zijn
-            dot_dir = abs(ci["dir"].dot(cj["dir"]))
-            if dot_dir < 0.99:
-                continue
-
-            diff = v_sub(cj["center"], ci["center"])
-            proj = diff.dot(ci["dir"])
-            lateral_vec = v_sub(diff, v_scale(ci["dir"], proj))
-            lateral = v_len(lateral_vec)
-
-            # Als de centra te ver uit elkaar liggen in laterale richting: geen door-gat
-            if lateral > ci["r"] * 0.25:
-                continue
-
-            depth = abs(proj)
-            # Depth moet grofweg rond plaatdikte liggen (met marge)
-            if depth < 0.2 or depth > max_depth:
-                continue
-
-            if depth > best_depth:
-                best_depth = depth
-                best_j = j
-
-        if best_j is None:
-            continue
-
-        used.add(i)
-        used.add(best_j)
-
-        ci_center = circles[i]["center"]
-        dir_vec = circles[i]["dir"]
-        r = circles[i]["r"]
-
-        cj_center = circles[best_j]["center"]
-        diff = v_sub(cj_center, ci_center)
-        proj = diff.dot(dir_vec)
-        mid = cq.Vector(
-            ci_center.x + 0.5 * proj * dir_vec.x,
-            ci_center.y + 0.5 * proj * dir_vec.y,
-            ci_center.z + 0.5 * proj * dir_vec.z,
-        )
-
-        try:
-            plane = cq.Plane((mid.x, mid.y, mid.z), (dir_vec.x, dir_vec.y, dir_vec.z))
-            wp = cq.Workplane(plane).circle(r)
-            pos = wp.extrude(best_depth / 2.0)
-            neg = wp.extrude(-best_depth / 2.0)
-            solid = pos.union(neg)
-            fills.append(solid)
-        except Exception as e:
-            print("⚠️ circular fill creation failed:", e)
-            continue
-
-    print(f"🟢 Circular fills created: {len(fills)}")
-    return fills
 
 
 # =====================================================
@@ -324,11 +218,11 @@ def detect_circular_hole_fills(shape, thickness_guess):
 
 @app.get("/")
 def root():
-    return {"status": "HangLogic v3.5.0 running"}
+    return {"status": "HangLogic v3.6.0 running"}
 
 
 # =====================================================
-# Main analyzer
+# Main Analyzer
 # =====================================================
 
 def ensure_step(filename):
@@ -344,83 +238,64 @@ async def analyze_step(file: UploadFile = File(...)):
     try:
         ensure_step(file.filename)
 
-        # Save STEP
+        # Save temp STEP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
 
+        # Load STEP
         model = cq.importers.importStep(tmp_step)
         shape = model.val()
 
         # Dimensions
         bbox = shape.BoundingBox()
         dims = {
-            "x": round(bbox.xlen, 3),
-            "y": round(bbox.ylen, 3),
-            "z": round(bbox.zlen, 3),
+            "X": round(bbox.xlen, 3),
+            "Y": round(bbox.ylen, 3),
+            "Z": round(bbox.zlen, 3),
         }
 
-        # Plaatdikte ≈ kleinste dimensie
-        thickness_guess = min(dims["x"], dims["y"], dims["z"])
-        if thickness_guess <= 0:
-            thickness_guess = 1.0
+        thickness = min(dims.values())
+        if thickness <= 0:
+            thickness = 1.0
 
-        # -----------------------------------------
-        # 1️⃣ Niet-ronde binnencontouren via planar wires
-        # -----------------------------------------
-        inner_data = detect_inner_wires(shape)
+        # Detect + fill holes
+        inner_wires = detect_inner_wires(shape)
         filled_solids = []
 
-        for f_idx, face, wires in inner_data:
+        for f_idx, face, wires in inner_wires:
             for w_idx, wire in enumerate(wires):
-                solid = build_solid_from_wire(face, wire, thickness_guess, f_idx, w_idx)
-                if solid is not None:
+                solid = build_solid_from_wire(face, wire, thickness, f_idx, w_idx)
+                if solid:
                     filled_solids.append(solid)
 
-        # -----------------------------------------
-        # 2️⃣ Ronde doorlopende gaten via circle-detectie
-        # -----------------------------------------
-        circular_fills = detect_circular_hole_fills(shape, thickness_guess)
-        filled_solids.extend(circular_fills)
-
-        # =====================================================
-        # Build GLB Assembly
-        # =====================================================
-
-        base_color = Color(0.6, 0.8, 1.0)   # lichtblauw
-        fill_color = Color(0.0, 1.0, 0.0)   # groen
-
+        # Build Assembly
         asm = cq.Assembly()
-        asm.add(shape, name="base", color=base_color)
+        asm.add(shape, name="base", color=Color(0.6, 0.8, 1.0))
 
-        for idx, solid in enumerate(filled_solids):
-            # extra safety: skip null solids
-            try:
-                if solid is None:
-                    continue
-                asm.add(solid, name=f"fill_{idx}", color=fill_color)
-            except Exception as e:
-                print(f"⚠️ Assembly add failed for fill_{idx}: {e}")
+        for i, solid in enumerate(filled_solids):
+            asm.add(solid, name=f"fill_{i}", color=Color(0, 1, 0))
 
+        # Export GLB
         tmp_glb = tmp_step.replace(".step", ".glb")
         asm.save(tmp_glb, exportType="GLTF")
 
-        # STL
+        # Export STL
         tmp_stl = tmp_step.replace(".step", ".stl")
         cq.exporters.export(shape, tmp_stl, "STL")
 
-        # Upload
+        # Upload to Supabase
         stl_url = upload_new_file(tmp_stl, file.filename.replace(".step", ".stl"))
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
-        # Save DB entry
+        # Store DB record
         if supabase:
             supabase.table("analyzed_parts").insert({
                 "filename": file.filename,
                 "dimensions": dims,
-                "bounding_box_x": dims["x"],
-                "bounding_box_y": dims["y"],
-                "bounding_box_z": dims["z"],
+                "bounding_box_x": dims["X"],
+                "bounding_box_y": dims["Y"],
+                "bounding_box_z": dims["Z"],
                 "holes_detected": len(filled_solids),
                 "units": "mm",
                 "model_url": stl_url,
@@ -428,25 +303,15 @@ async def analyze_step(file: UploadFile = File(...)):
                 "created_at": "now()"
             }).execute()
 
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "dimensions": dims,
-            "filledContours": len(filled_solids),
-            "modelURL": stl_url,
-            "modelURL_GLB": glb_url,
-        }
+        return safe_response_success(file.filename, dims, stl_url, glb_url, len(filled_solids))
 
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e), "trace": traceback.format_exc()},
-        )
+        return safe_response_error(str(e), traceback.format_exc())
 
     finally:
         for p in [tmp_step, tmp_stl, tmp_glb]:
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
-            except Exception:
+            except:
                 pass
