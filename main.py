@@ -6,19 +6,25 @@ import cadquery as cq
 from cadquery import Color
 
 import tempfile
-import os
-import math
 import traceback
+import os
+import numpy as np
 
 from supabase import create_client, Client
+
 from OCP.ShapeFix import ShapeFix_Wire
+from OCP.BRepAdaptor import BRepAdaptor_Surface
+
+import trimesh
+import json
+from io import StringIO
 
 
 # =====================================================
-# FastAPI setup
+# FastAPI Setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="3.8.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +36,7 @@ app.add_middleware(
 
 
 # =====================================================
-# Supabase
+# Supabase Setup
 # =====================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -44,17 +50,12 @@ else:
     print("⚠️ Missing Supabase credentials")
 
 
-def upload_new_file(local_path: str, remote_name: str) -> str:
-    """
-    Uploads a file to Supabase with a guaranteed unique name.
-    """
-    if not supabase:
-        raise RuntimeError("Supabase not initialized")
-
+def upload_unique(local_path: str, original_name: str) -> str:
+    """Upload met unieke naam, nooit overschrijven."""
     bucket = "cad-models"
     storage = supabase.storage.from_(bucket)
 
-    base, ext = os.path.splitext(remote_name)
+    base, ext = os.path.splitext(original_name)
     unique_name = f"{base}_{os.urandom(4).hex()}{ext}"
     remote_path = f"analyzed/{unique_name}"
 
@@ -65,298 +66,233 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
 
 
 # =====================================================
-# Helpers: STEP + bounding box + error payload
+# Reliable GLB Exporter (kleur + single-file)
 # =====================================================
 
-def ensure_step(filename: str):
-    ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".step", ".stp"]:
-        raise HTTPException(status_code=415, detail="Upload .STEP or .STP only")
-
-
-def make_bbox_dims(bbox) -> dict:
+def assembly_to_glb(assembly: cq.Assembly, out_path: str):
     """
-    Zelfde logica als je oude API:
-    grootste maat = X, middel = Y, kleinste = Z.
+    - Converteert CadQuery Assembly (met kleuren) naar één .glb bestand.
+    - Compatibel met alle CadQuery versies (geen Assembly.export nodig).
+    - Gebruikt ThreeJS JSON + Trimesh → GLB converter.
     """
-    raw = [float(bbox.xlen), float(bbox.ylen), float(bbox.zlen)]
-    sorted_dims = sorted(raw, reverse=True)
-    return {
-        "X": round(sorted_dims[0], 3),
-        "Y": round(sorted_dims[1], 3),
-        "Z": round(sorted_dims[2], 3),
-    }
 
+    meshes = []
 
-def safe_error_payload(filename: str | None, message: str, trace: str):
-    """
-    Altijd geldig schema teruggeven, zodat Lovable nooit meer crasht
-    op het lezen van boundingBoxMM.X.
-    """
-    return {
-        "status": "error",
-        "units": "mm",
-        "boundingBoxMM": {"X": 0.0, "Y": 0.0, "Z": 0.0},
-        "volumeMM3": None,
-        "filename": filename,
-        "holesDetected": 0,
-        "holes": [],
-        "modelURL": None,
-        "modelURL_GLB": None,
-        "message": message,
-        "trace": trace,
-    }
+    def walk(node: cq.Assembly, parent_transform=np.eye(4)):
+        # Lokale matrix naar numpy
+        local = np.array(node.loc.toMatrix())
+        transform = parent_transform @ local
+
+        # Als node een shape heeft → mesh maken
+        if node.shape:
+            threejs_str = cq.exporters.toString(node.shape, "TJS")
+
+            # Trimesh lastig → direct JSON lezen
+            data = json.load(StringIO(threejs_str))
+            tm = trimesh.load(data, file_type='dict')
+            tm.apply_transform(transform)
+
+            # Kleur
+            if node.color:
+                r, g, b, a = node.color.wrapped.GetRGB()
+                rgba = [int(r*255), int(g*255), int(b*255), int(a*255)]
+                tm.visual.vertex_colors = np.tile(rgba, (len(tm.vertices), 1))
+
+            meshes.append(tm)
+
+        for child in node.children:
+            walk(child, transform)
+
+    walk(assembly)
+
+    scene = trimesh.Scene(meshes)
+    scene.export(out_path)  # ext bepaalt GLB export
 
 
 # =====================================================
-# Geometry: binnencontouren op vlakke vlakken
+# Wire Fix Helper
 # =====================================================
 
-def repair_wire(wire: cq.Wire) -> cq.Wire:
-    """
-    Probeert een wire netjes te fixen/sluiten.
-    """
+def repair_wire(wire):
+    """Repareert slechte STEP wires (open, self-intersecting)."""
     try:
-        fixer = ShapeFix_Wire(wire.wrapped)
+        fixer = ShapeFix_Wire(wire)
         fixer.ClosedWireMode()
         fixer.FixReorder()
         fixer.FixConnected()
         fixer.FixSelfIntersection()
         fixer.SetPrecision(1e-6)
-        fixed_wrapped = fixer.Wire()
-        fixed = cq.Wire(fixed_wrapped)
-        if fixed and (not fixed.isNull()):
-            return fixed
-    except Exception as e:
-        print("⚠️ ShapeFix_Wire failed:", e)
-
-    return wire
+        return fixer.Wire()
+    except:
+        return wire
 
 
-def detect_inner_wires_planar(shape: cq.Shape):
+# =====================================================
+# Detect Inner Closed Contours
+# =====================================================
+
+def detect_inner_contours(shape):
     """
-    Detecteert gesloten binnencontouren op vlakke faces.
-
-    - alleen planar faces
-    - grootste wire (area) = outer
-    - alle kleinere gesloten wires = inner
-
-    Retourneert: list[(face_index, face, [inner_wires])]
+    Voor elke face:
+    - Vind ALLE wires
+    - Outer wire = grootste area
+    - Inner wires = rest
     """
-    result = []
+    results = []
 
     for f_idx, face in enumerate(shape.Faces()):
-        try:
-            if not face.isPlane():
-                continue
-        except Exception:
-            continue
-
         wires = list(face.Wires())
         if len(wires) <= 1:
             continue
 
-        # area per wire bepalen
+        # bepaal area per wire
         areas = []
         for w in wires:
             try:
-                if w.isNull():
-                    areas.append(0.0)
-                    continue
-                fw = cq.Face.makeFromWires(w)
-                areas.append(abs(float(fw.Area())))
-            except Exception:
-                areas.append(0.0)
+                areas.append(abs(w.Area()))
+            except:
+                areas.append(0)
 
-        if not areas:
-            continue
+        # grootste = outer
+        max_idx = areas.index(max(areas))
+        inner = [wires[i] for i in range(len(wires)) if i != max_idx]
 
-        outer_idx = max(range(len(areas)), key=lambda i: areas[i])
+        if inner:
+            results.append((f_idx, face, inner))
 
-        inner_wires: list[cq.Wire] = []
-        for i, w in enumerate(wires):
-            if i == outer_idx:
-                continue
-            try:
-                if w.isNull():
-                    continue
-                if hasattr(w, "isClosed") and not w.isClosed():
-                    continue
-                if len(w.Edges()) == 0:
-                    continue
-            except Exception:
-                continue
-            inner_wires.append(w)
-
-        if inner_wires:
-            result.append((f_idx, face, inner_wires))
-
-    print(f"🟢 Planar faces with inner wires: {len(result)}")
-    return result
+    return results
 
 
-def build_fill_from_wire(face: cq.Face,
-                         wire: cq.Wire,
-                         thickness: float,
-                         f_idx: int,
-                         w_idx: int):
-    """
-    Maakt een 'plug' door de plaat heen voor één binnencontour.
-    """
+# =====================================================
+# Build Fill Solid
+# =====================================================
+
+def build_fill(face, wire, thickness, f_idx, w_idx):
+    """Extrude het wire precies langs de face normaal."""
     wire = repair_wire(wire)
 
-    try:
-        if wire.isNull() or wire.Length() < 0.1:
-            print(f"⚠️ Skipping tiny/invalid wire on face {f_idx}, wire {w_idx}")
-            return None
-    except Exception:
+    if wire.isNull() or wire.Length() < 0.1:
+        print(f"⚠️ Wire {w_idx} on face {f_idx} is invalid.")
         return None
 
-    # normaalvector van de face
-    try:
-        normal = face.normalAt()
-    except Exception:
-        normal = cq.Vector(0, 0, 1)
+    # center
+    center = wire.Center()
 
-    # centerpunt van de wire
+    # surface normal
+    surf = BRepAdaptor_Surface(face.wrapped)
     try:
-        center = wire.Center()
-    except Exception:
-        center = face.Center()
+        u, v = surf.ValueOfUV(center.x, center.y, center.z)
+    except:
+        return None
 
-    plane = cq.Plane((center.x, center.y, center.z),
-                     (normal.x, normal.y, normal.z))
+    n = surf.Normal(u, v)
+    normal = cq.Vector(n.X(), n.Y(), n.Z()).normalized()
+
+    # plane
+    plane = cq.Plane(
+        (center.x, center.y, center.z),
+        (normal.x, normal.y, normal.z)
+    )
 
     try:
         wp = cq.Workplane(plane).add(wire)
-        depth = thickness if thickness > 0 else 1.0
-
-        pos = wp.toPending().extrude(depth / 2.0)
-        neg = wp.toPending().extrude(-depth / 2.0)
-        solid = pos.union(neg)
-        return solid
+        a = wp.toPending().extrude(thickness / 2)
+        b = wp.toPending().extrude(-thickness / 2)
+        return a.union(b)
     except Exception as e:
         print(f"⚠️ Fill failed on face {f_idx}, wire {w_idx}: {e}")
         return None
 
 
 # =====================================================
-# Routes
+# API Root
 # =====================================================
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v3.8.0)"}
+    return {"status": "HangLogic Analyzer v4.0.0 running"}
 
+
+# =====================================================
+# Analyze Endpoint
+# =====================================================
 
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_step = tmp_stl = tmp_glb = None
-    filename = file.filename
 
     try:
-        ensure_step(filename)
+        if not file.filename.lower().endswith((".step", ".stp")):
+            raise HTTPException(415, "Upload alleen .STEP / .STP")
 
-        # 1️⃣ STEP tijdelijk wegschrijven
+        # Save temp STEP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
 
-        # 2️⃣ STEP inladen
+        # Load
         model = cq.importers.importStep(tmp_step)
         shape = model.val()
-        print(f"🧠 Analyzing: {filename}")
 
-        # 3️⃣ Bounding box + dikte
-        bbox = shape.BoundingBox()
-        dims = make_bbox_dims(bbox)
-        thickness = min(dims["X"], dims["Y"], dims["Z"])
-        if thickness <= 0:
-            thickness = 1.0
+        # Bounding box
+        bb = shape.BoundingBox()
+        dims = {
+            "x": round(bb.xlen, 3),
+            "y": round(bb.ylen, 3),
+            "z": round(bb.zlen, 3),
+        }
 
-        # 4️⃣ Volume
-        try:
-            volume_mm3 = float(shape.Volume())
-        except Exception:
-            volume_mm3 = None
+        thickness = dims["z"]
 
-        # 5️⃣ Binnencontouren zoeken en vullen (alleen planar faces)
-        inner_data = detect_inner_wires_planar(shape)
+        # Detect holes
+        inner_data = detect_inner_contours(shape)
         fills = []
 
         for f_idx, face, wires in inner_data:
             for w_idx, wire in enumerate(wires):
-                solid = build_fill_from_wire(face, wire, thickness, f_idx, w_idx)
-                if solid is not None:
+                solid = build_fill(face, wire, thickness, f_idx, w_idx)
+                if solid:
                     fills.append(solid)
 
-        holes_detected = len(fills)
-
-        # 6️⃣ Assembly met kleuren -> GLB
-        base_color = Color(0.6, 0.8, 1.0)   # lichtblauw
-        fill_color = Color(0.0, 1.0, 0.0)   # groen
-
+        # Assembly met kleur
         asm = cq.Assembly()
-        asm.add(shape, name="base", color=base_color)
+        asm.add(shape, name="base", color=Color(0.6, 0.8, 1.0))
 
         for idx, solid in enumerate(fills):
-            try:
-                asm.add(solid, name=f"fill_{idx}", color=fill_color)
-            except Exception as e:
-                print(f"⚠️ Assembly add failed for fill_{idx}: {e}")
+            asm.add(solid, name=f"fill_{idx}", color=Color(0, 1, 0))
 
-        tmp_glb = tmp_step.replace(".step", ".glb")
-
-        # BELANGRIJK: officiële export-API → bewaart kleurinformatie
-        # .export kiest automatisch GLTF op basis van extensie (.glb)
-        asm.export(tmp_glb)   # kleuren worden hierbij meegenomen
-
-        # 7️⃣ STL export (zonder kleur)
-        tmp_stl = tmp_step.replace(".step", ".stl")
+        # Export STL
+        tmp_stl = tmp_step.replace(".step", "_base.stl")
         cq.exporters.export(shape, tmp_stl, "STL")
 
-        # 8️⃣ Upload naar Supabase
-        stl_url = upload_new_file(tmp_stl, filename.replace(".step", ".stl"))
-        glb_url = upload_new_file(tmp_glb, filename.replace(".step", ".glb"))
+        # Export GLB (perfect)
+        tmp_glb = tmp_step.replace(".step", ".glb")
+        assembly_to_glb(asm, tmp_glb)
 
-        # 9️⃣ Wegschrijven in DB
-        if supabase:
-            supabase.table("analyzed_parts").insert({
-                "filename": filename,
-                "dimensions": dims,
-                "bounding_box_x": dims["X"],
-                "bounding_box_y": dims["Y"],
-                "bounding_box_z": dims["Z"],
-                "holes_detected": holes_detected,
-                "units": "mm",
-                "model_url": stl_url,
-                "model_url_glb": glb_url,
-                "created_at": "now()"
-            }).execute()
+        # Upload
+        stl_url = upload_unique(tmp_stl, file.filename.replace(".step", ".stl"))
+        glb_url = upload_unique(tmp_glb, file.filename.replace(".step", ".glb"))
 
-        # 🔟 Response in exact schema dat Lovable verwacht
-        payload = {
+        return {
             "status": "success",
             "units": "mm",
-            "boundingBoxMM": dims,
-            "volumeMM3": round(volume_mm3, 3) if volume_mm3 is not None else None,
-            "filename": filename,
-            "holesDetected": holes_detected,
-            "holes": [],              # eventueel later nog data invullen
+            "filename": file.filename,
+            "boundingBoxMM": {"X": dims["x"], "Y": dims["y"], "Z": dims["z"]},
+            "holesDetected": len(inner_data),
             "modelURL": stl_url,
             "modelURL_GLB": glb_url,
         }
-        return JSONResponse(content=payload)
 
     except Exception as e:
-        tb = traceback.format_exc(limit=5)
-        print("❌ Analysis failed:", e)
-        return JSONResponse(content=safe_error_payload(filename, str(e), tb))
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e), "trace": traceback.format_exc()}
+        )
 
     finally:
         for p in [tmp_step, tmp_stl, tmp_glb]:
-            try:
-                if p and os.path.exists(p):
+            if p and os.path.exists(p):
+                try:
                     os.remove(p)
-            except Exception:
-                pass
+                except:
+                    pass
