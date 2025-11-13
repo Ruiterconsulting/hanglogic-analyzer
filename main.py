@@ -1,17 +1,25 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 import cadquery as cq
 from cadquery import Color
+
 import tempfile
 import os
-import math
 import traceback
+
 from supabase import create_client, Client
-import httpx
+
+from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.ShapeFix import ShapeFix_Wire
 
 
-app = FastAPI(title="HangLogic Analyzer API", version="2.3.0")
+# =====================================================
+# FastAPI setup
+# =====================================================
+
+app = FastAPI(title="HangLogic Analyzer API", version="2.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,9 +30,10 @@ app.add_middleware(
 )
 
 
-# ------------------------------
-# Supabase connect
-# ------------------------------
+# =====================================================
+# Supabase
+# =====================================================
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -36,21 +45,14 @@ else:
     print("⚠️ Missing Supabase credentials")
 
 
-# ------------------------------
-# Upload helper (unique filenames)
-# ------------------------------
 def upload_new_file(local_path: str, remote_name: str) -> str:
-    if not supabase:
-        raise RuntimeError("Supabase not initialized")
-
+    """Uploads file to Supabase with guaranteed unique filename."""
     bucket = "cad-models"
     storage = supabase.storage.from_(bucket)
 
     base, ext = os.path.splitext(remote_name)
     unique_name = f"{base}_{os.urandom(4).hex()}{ext}"
-
     remote_path = f"analyzed/{unique_name}"
-    print("📤 Upload:", remote_path)
 
     with open(local_path, "rb") as f:
         storage.upload(remote_path, f)
@@ -58,41 +60,109 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
     return storage.get_public_url(remote_path)
 
 
-# ------------------------------
-# Detect inner wires (all interior contours)
-# ------------------------------
+# =====================================================
+# Utility: Wire Repair
+# =====================================================
+
+def repair_wire(wire):
+    """Forcefully repair and close problematic STEP wires."""
+    try:
+        fixer = ShapeFix_Wire(wire)
+        fixer.ClosedWireMode()
+        fixer.FixReorder()
+        fixer.FixConnected()
+        fixer.FixSelfIntersection()
+        fixer.SetPrecision(1e-6)
+        return fixer.Wire()
+    except:
+        return wire
+
+
+# =====================================================
+# Utility: Detect inner wires
+# =====================================================
+
 def detect_inner_wires(shape):
     data = []
-
     for f_idx, face in enumerate(shape.Faces()):
         wires = list(face.Wires())
 
         if len(wires) <= 1:
             continue
 
-        # wire 0 = outer boundary
         inner = wires[1:]
-
         data.append((f_idx, face, inner))
-
     return data
 
 
-# ------------------------------
+# =====================================================
+# Utility: Fill hole → perfect extrusion
+# =====================================================
+
+def build_solid_from_wire(face, wire, thickness, f_idx, w_idx):
+    """Extrudes a repaired wire EXACT along the true face normal."""
+
+    # 1️⃣ Repair the wire
+    wire = repair_wire(wire)
+
+    # Skip empty wires after fix
+    if wire.isNull() or wire.Length() < 0.1:
+        print(f"⚠️ Repaired wire on face {f_idx} still invalid")
+        return None
+
+    # 2️⃣ Real surface
+    surf = BRepAdaptor_Surface(face.wrapped)
+
+    # 3️⃣ Real (u,v) location
+    center = wire.Center()
+    try:
+        u, v = face._geomAdaptor().ValueOfUV(center.x, center.y, center.z)
+    except:
+        try:
+            # fallback: find closest UV
+            u, v = surf.ValueOfUV(center.x, center.y, center.z)
+        except:
+            return None
+
+    # 4️⃣ Real surface normal
+    n = surf.Normal(u, v)
+    normal = cq.Vector(n.X(), n.Y(), n.Z()).normalized()
+
+    # 5️⃣ Construct precise plane in face orientation
+    plane = cq.Plane((center.x, center.y, center.z), (normal.x, normal.y, normal.z))
+
+    try:
+        wp = cq.Workplane(plane).add(wire)
+
+        pos = wp.toPending().extrude(thickness / 2)
+        neg = wp.toPending().extrude(-thickness / 2)
+
+        return pos.union(neg)
+
+    except Exception as e:
+        print(f"⚠️ fill failed on face {f_idx}, wire {w_idx}: {e}")
+        return None
+
+
+# =====================================================
+# API Root
+# =====================================================
+
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "2.3.0"}
+    return {"status": "HangLogic v2.3.1 running"}
 
+
+# =====================================================
+# Main analyzer
+# =====================================================
 
 def ensure_step(filename):
     ext = (os.path.splitext(filename)[1] or "").lower()
-    if ext not in [".stp", ".step"]:
-        raise HTTPException(415, "Upload only .STEP or .STP files")
+    if ext not in [".step", ".stp"]:
+        raise HTTPException(415, "Upload .STEP or .STP only")
 
 
-# ------------------------------
-# MAIN ANALYZER
-# ------------------------------
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_step = tmp_stl = tmp_glb = None
@@ -100,7 +170,7 @@ async def analyze_step(file: UploadFile = File(...)):
     try:
         ensure_step(file.filename)
 
-        # save STEP
+        # Save STEP
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
@@ -108,90 +178,46 @@ async def analyze_step(file: UploadFile = File(...)):
         model = cq.importers.importStep(tmp_step)
         shape = model.val()
 
+        # Dimensions
         bbox = shape.BoundingBox()
         dims = {
             "x": round(bbox.xlen, 3),
             "y": round(bbox.ylen, 3),
-            "z": round(bbox.zlen, 3)
+            "z": round(bbox.zlen, 3),
         }
-
         thickness = dims["z"]
 
+        # Detect holes/inner contours
         inner_data = detect_inner_wires(shape)
 
         filled_solids = []
 
-        # -----------------------------
-        # Generate contour fills
-        # -----------------------------
+        # Build solids for each inner contour
         for f_idx, face, wires in inner_data:
             for w_idx, wire in enumerate(wires):
 
-                # STRONG WIRE VALIDATION
-                try:
-                    if wire.isNull():
-                        print(f"⚠️ Null wire on face {f_idx}, wire {w_idx}")
-                        continue
-
-                    if wire.Length() < 0.1:
-                        print(f"⚠️ tiny wire skipped on face {f_idx}, wire {w_idx}")
-                        continue
-
-                    edges = wire.Edges()
-                    if len(edges) == 0:
-                        print(f"⚠️ zero-edge wire skipped")
-                        continue
-
-                    if any(e.isNull() for e in edges):
-                        print(f"⚠️ null edge detected in wire")
-                        continue
-
-                except Exception as e:
-                    print(f"⚠️ wire validation failed: {e}")
+                # Hard validation
+                if wire.isNull() or wire.Length() < 0.1:
+                    print(f"⚠️ Skipping null/tiny wire {w_idx}")
                     continue
 
-                # Normal
-                try:
-                    normal = face.normalAt()
-                except:
-                    normal = cq.Vector(0, 0, 1)
+                solid = build_solid_from_wire(face, wire, thickness, f_idx, w_idx)
 
-                # Centerpoint
-                try:
-                    center = wire.Center()
-                except:
-                    center = face.Center()
-
-                plane = cq.Plane(
-                    (center.x, center.y, center.z),
-                    (normal.x, normal.y, normal.z)
-                )
-
-                try:
-                    wp = cq.Workplane(plane).add(wire)
-
-                    # Symmetric through full plate
-                    pos = wp.toPending().extrude(thickness / 2)
-                    neg = wp.toPending().extrude(-thickness / 2)
-                    solid = pos.union(neg)
-
+                if solid:
                     filled_solids.append(solid)
 
-                except Exception as e:
-                    print(f"⚠️ fill failed on face {f_idx}, wire {w_idx}: {e}")
+        # =====================================================
+        # Build GLB Assembly
+        # =====================================================
 
-        # -----------------------------
-        # Build GLB assembly (Colors MUST be `Color()` objects)
-        # -----------------------------
-        color_base = Color(0.6, 0.8, 1.0)
-        color_fill = Color(0.0, 1.0, 0.0)
+        base_color = Color(0.6, 0.8, 1.0)
+        fill_color = Color(0.0, 1.0, 0.0)
 
         asm = cq.Assembly()
-
-        asm.add(shape, name="base", color=color_base)
+        asm.add(shape, name="base", color=base_color)
 
         for idx, solid in enumerate(filled_solids):
-            asm.add(solid, name=f"fill_{idx}", color=color_fill)
+            asm.add(solid, name=f"fill_{idx}", color=fill_color)
 
         tmp_glb = tmp_step.replace(".step", ".glb")
         asm.save(tmp_glb, exportType="GLTF")
@@ -204,7 +230,7 @@ async def analyze_step(file: UploadFile = File(...)):
         stl_url = upload_new_file(tmp_stl, file.filename.replace(".step", ".stl"))
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
-        # DB
+        # Save DB entry
         supabase.table("analyzed_parts").insert({
             "filename": file.filename,
             "dimensions": dims,
@@ -224,13 +250,13 @@ async def analyze_step(file: UploadFile = File(...)):
             "dimensions": dims,
             "filledContours": len(filled_solids),
             "modelURL": stl_url,
-            "modelURL_GLB": glb_url
+            "modelURL_GLB": glb_url,
         }
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"error": str(e), "trace": traceback.format_exc()}
+            content={"error": str(e), "trace": traceback.format_exc()},
         )
 
     finally:
