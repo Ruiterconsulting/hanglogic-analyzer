@@ -7,18 +7,16 @@ from cadquery import Color
 
 import tempfile
 import os
-import math
 import traceback
 
 from supabase import create_client, Client
-from OCP.ShapeFix import ShapeFix_Wire
 
 
 # =====================================================
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="3.6.0")
+app = FastAPI(title="HangLogic Analyzer API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,9 +44,6 @@ else:
 
 def upload_new_file(local_path: str, remote_name: str) -> str:
     """Uploads file to Supabase with guaranteed unique filename."""
-    if not supabase:
-        raise RuntimeError("Supabase not initialized")
-
     bucket = "cad-models"
     storage = supabase.storage.from_(bucket)
 
@@ -63,27 +58,36 @@ def upload_new_file(local_path: str, remote_name: str) -> str:
 
 
 # =====================================================
-# JSON helpers — belangrijkste fix voor Lovable
+# Utility: Always uppercase dimensions (Lovable safety)
+# =====================================================
+
+def force_dimensions_uppercase(dims):
+    """Guarantees X/Y/Z always exist with uppercase keys."""
+    return {
+        "X": float(dims.get("X") or dims.get("x") or 0.0),
+        "Y": float(dims.get("Y") or dims.get("y") or 0.0),
+        "Z": float(dims.get("Z") or dims.get("z") or 0.0),
+    }
+
+
+# =====================================================
+# Safe response wrappers (prevent Lovable crashes)
 # =====================================================
 
 def safe_response_success(filename, dims, stl_url, glb_url, filled):
-    """Altijd hoofdletters X/Y/Z om Lovable crashes te voorkomen."""
+    dims = force_dimensions_uppercase(dims)
     return {
         "status": "success",
         "filename": filename,
-        "dimensions": {
-            "X": dims["X"],
-            "Y": dims["Y"],
-            "Z": dims["Z"],
-        },
+        "dimensions": dims,      # ALWAYS X/Y/Z
         "filledContours": filled,
-        "modelURL": stl_url,
-        "modelURL_GLB": glb_url,
+        "modelURL": stl_url,     # STL (Lovable can ignore this)
+        "modelURL_GLB": glb_url  # GLB (WITH COLORS)
     }
 
 
 def safe_response_error(message, trace=""):
-    """Ook bij errors nooit undefined dimensions → voorkomt frontend crash."""
+    """Lovable-compatible error. Never breaks UI."""
     return {
         "status": "error",
         "filename": None,
@@ -92,137 +96,21 @@ def safe_response_error(message, trace=""):
         "modelURL": None,
         "modelURL_GLB": None,
         "message": message,
-        "trace": trace,
+        "trace": trace
     }
 
 
 # =====================================================
-# Wire Repair
-# =====================================================
-
-def repair_wire(wire):
-    """Hard-fixes STEP wires."""
-    try:
-        fixer = ShapeFix_Wire(wire)
-        fixer.ClosedWireMode()
-        fixer.FixReorder()
-        fixer.FixConnected()
-        fixer.FixSelfIntersection()
-        fixer.SetPrecision(1e-6)
-        fixed = fixer.Wire()
-        return fixed if not fixed.IsNull() else wire
-    except:
-        return wire
-
-
-# =====================================================
-# Detect **gesloten** binnencontouren (alleen vlakke faces)
-# =====================================================
-
-def detect_inner_wires(shape):
-    """
-    Detecteert A-type gaten:
-    - alleen vlakke faces
-    - grootste wire = outer
-    - smallere wires = binnencontouren (gaten)
-    """
-    cleaned = []
-
-    for f_idx, face in enumerate(shape.Faces()):
-        try:
-            if not face.isPlane():
-                continue
-        except:
-            continue
-
-        wires = list(face.Wires())
-        if len(wires) <= 1:
-            continue
-
-        # Compute wire area to detect outer
-        areas = []
-        for w in wires:
-            try:
-                fw = cq.Face.makeFromWires(w)
-                areas.append(abs(fw.Area()))
-            except:
-                areas.append(0)
-
-        outer_index = max(range(len(areas)), key=lambda i: areas[i])
-
-        inner = []
-        for i, w in enumerate(wires):
-            if i == outer_index:
-                continue
-            try:
-                if w.isNull():
-                    continue
-                if hasattr(w, "isClosed") and not w.isClosed():
-                    continue
-                if len(w.Edges()) == 0:
-                    continue
-            except:
-                continue
-            inner.append(w)
-
-        if inner:
-            cleaned.append((f_idx, face, inner))
-
-    print(f"🟢 Detected planar inner contours on {len(cleaned)} faces")
-    return cleaned
-
-
-# =====================================================
-# Fill a single closed contour
-# =====================================================
-
-def build_solid_from_wire(face, wire, thickness, f_idx, w_idx):
-    """Extrudes inner contour exactly in both directions."""
-    wire = repair_wire(wire)
-
-    try:
-        if wire.isNull() or wire.Length() < 0.1:
-            return None
-    except:
-        return None
-
-    try:
-        normal = face.normalAt()
-    except:
-        normal = cq.Vector(0, 0, 1)
-
-    try:
-        center = wire.Center()
-    except:
-        center = face.Center()
-
-    plane = cq.Plane((center.x, center.y, center.z),
-                     (normal.x, normal.y, normal.z))
-
-    try:
-        wp = cq.Workplane(plane).add(wire)
-
-        pos = wp.toPending().extrude(thickness / 2)
-        neg = wp.toPending().extrude(-thickness / 2)
-
-        return pos.union(neg)
-
-    except Exception as e:
-        print(f"⚠️ Fill failed on face {f_idx} wire {w_idx}: {e}")
-        return None
-
-
-# =====================================================
-# API Root
+# Root endpoint
 # =====================================================
 
 @app.get("/")
 def root():
-    return {"status": "HangLogic v3.6.0 running"}
+    return {"status": "HangLogic v3.0.0 running"}
 
 
 # =====================================================
-# Main Analyzer
+# Only allow STEP files
 # =====================================================
 
 def ensure_step(filename):
@@ -231,6 +119,10 @@ def ensure_step(filename):
         raise HTTPException(415, "Upload .STEP or .STP only")
 
 
+# =====================================================
+# MAIN ANALYZER — stable version (no filling yet)
+# =====================================================
+
 @app.post("/analyze")
 async def analyze_step(file: UploadFile = File(...)):
     tmp_step = tmp_stl = tmp_glb = None
@@ -238,72 +130,65 @@ async def analyze_step(file: UploadFile = File(...)):
     try:
         ensure_step(file.filename)
 
-        # Save temp STEP
+        # Save input STEP file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as t:
             t.write(await file.read())
             tmp_step = t.name
 
-        # Load STEP
+        # Load with CadQuery
         model = cq.importers.importStep(tmp_step)
         shape = model.val()
 
-        # Dimensions
+        # Compute bounding box
         bbox = shape.BoundingBox()
-        dims = {
-            "X": round(bbox.xlen, 3),
-            "Y": round(bbox.ylen, 3),
-            "Z": round(bbox.zlen, 3),
-        }
 
-        thickness = min(dims.values())
-        if thickness <= 0:
-            thickness = 1.0
+        dims = force_dimensions_uppercase({
+            "x": round(bbox.xlen, 3),
+            "y": round(bbox.ylen, 3),
+            "z": round(bbox.zlen, 3)
+        })
 
-        # Detect + fill holes
-        inner_wires = detect_inner_wires(shape)
-        filled_solids = []
+        # =====================================================
+        # Build GLB with color (STL has no color!)
+        # =====================================================
+        base_color = Color(0.6, 0.8, 1.0)  # light blue
 
-        for f_idx, face, wires in inner_wires:
-            for w_idx, wire in enumerate(wires):
-                solid = build_solid_from_wire(face, wire, thickness, f_idx, w_idx)
-                if solid:
-                    filled_solids.append(solid)
-
-        # Build Assembly
         asm = cq.Assembly()
-        asm.add(shape, name="base", color=Color(0.6, 0.8, 1.0))
+        asm.add(shape, name="base", color=base_color)
 
-        for i, solid in enumerate(filled_solids):
-            asm.add(solid, name=f"fill_{i}", color=Color(0, 1, 0))
-
-        # Export GLB
         tmp_glb = tmp_step.replace(".step", ".glb")
         asm.save(tmp_glb, exportType="GLTF")
 
-        # Export STL
+        # Export STL (no color)
         tmp_stl = tmp_step.replace(".step", ".stl")
         cq.exporters.export(shape, tmp_stl, "STL")
 
-        # Upload to Supabase
+        # Upload both
         stl_url = upload_new_file(tmp_stl, file.filename.replace(".step", ".stl"))
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
-        # Store DB record
-        if supabase:
-            supabase.table("analyzed_parts").insert({
-                "filename": file.filename,
-                "dimensions": dims,
-                "bounding_box_x": dims["X"],
-                "bounding_box_y": dims["Y"],
-                "bounding_box_z": dims["Z"],
-                "holes_detected": len(filled_solids),
-                "units": "mm",
-                "model_url": stl_url,
-                "model_url_glb": glb_url,
-                "created_at": "now()"
-            }).execute()
+        # Store in DB
+        supabase.table("analyzed_parts").insert({
+            "filename": file.filename,
+            "dimensions": dims,
+            "bounding_box_x": dims["X"],
+            "bounding_box_y": dims["Y"],
+            "bounding_box_z": dims["Z"],
+            "holes_detected": 0,   # filling komt later weer terug
+            "units": "mm",
+            "model_url": stl_url,
+            "model_url_glb": glb_url,
+            "created_at": "now()"
+        }).execute()
 
-        return safe_response_success(file.filename, dims, stl_url, glb_url, len(filled_solids))
+        # SUCCESS RESPONSE (Lovable safe)
+        return safe_response_success(
+            file.filename,
+            dims,
+            stl_url,
+            glb_url,
+            filled=0
+        )
 
     except Exception as e:
         return safe_response_error(str(e), traceback.format_exc())
