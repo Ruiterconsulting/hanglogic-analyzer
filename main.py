@@ -7,11 +7,10 @@ from cadquery import Color
 
 import tempfile
 import os
+import math
 import traceback
 
 from supabase import create_client, Client
-
-from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.ShapeFix import ShapeFix_Wire
 
 
@@ -19,7 +18,7 @@ from OCP.ShapeFix import ShapeFix_Wire
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="2.3.1")
+app = FastAPI(title="HangLogic Analyzer API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +46,9 @@ else:
 
 def upload_new_file(local_path: str, remote_name: str) -> str:
     """Uploads file to Supabase with guaranteed unique filename."""
+    if not supabase:
+        raise RuntimeError("Supabase not initialized")
+
     bucket = "cad-models"
     storage = supabase.storage.from_(bucket)
 
@@ -74,69 +76,70 @@ def repair_wire(wire):
         fixer.FixSelfIntersection()
         fixer.SetPrecision(1e-6)
         return fixer.Wire()
-    except:
+    except Exception as e:
+        print("⚠️ ShapeFix_Wire failed:", e)
         return wire
 
 
 # =====================================================
-# Utility: Detect inner wires
+# Utility: Detect inner wires (non-round holes / slots / stars)
 # =====================================================
 
 def detect_inner_wires(shape):
+    """
+    Detect inner wires per face.
+    Returns list of (face_index, cq.Face, [cq.Wire, ...])
+    """
     data = []
     for f_idx, face in enumerate(shape.Faces()):
         wires = list(face.Wires())
-
         if len(wires) <= 1:
             continue
 
+        # Simpel: neem alle wires behalve de eerste als 'inner'
+        # (werkt in de meeste planar cases; rond gaten worden aanvullend via circle-detectie gedaan)
         inner = wires[1:]
-        data.append((f_idx, face, inner))
+        if inner:
+            data.append((f_idx, face, inner))
     return data
 
 
 # =====================================================
-# Utility: Fill hole → perfect extrusion
+# Utility: Fill from wire (general inner contour)
 # =====================================================
 
 def build_solid_from_wire(face, wire, thickness, f_idx, w_idx):
-    """Extrudes a repaired wire EXACT along the true face normal."""
-
-    # 1️⃣ Repair the wire
+    """
+    Extrudes a repaired wire along the local face normal.
+    Geschikt voor vlakke faces (plaat, flens, etc.).
+    """
+    # Repair wire
     wire = repair_wire(wire)
 
-    # Skip empty wires after fix
     if wire.isNull() or wire.Length() < 0.1:
         print(f"⚠️ Repaired wire on face {f_idx} still invalid")
         return None
 
-    # 2️⃣ Real surface
-    surf = BRepAdaptor_Surface(face.wrapped)
-
-    # 3️⃣ Real (u,v) location
-    center = wire.Center()
+    # Veilig normale pakken
     try:
-        u, v = face._geomAdaptor().ValueOfUV(center.x, center.y, center.z)
-    except:
-        try:
-            # fallback: find closest UV
-            u, v = surf.ValueOfUV(center.x, center.y, center.z)
-        except:
-            return None
+        normal = face.normalAt()
+    except Exception:
+        normal = cq.Vector(0, 0, 1)
 
-    # 4️⃣ Real surface normal
-    n = surf.Normal(u, v)
-    normal = cq.Vector(n.X(), n.Y(), n.Z()).normalized()
+    # Center van wire pakken
+    try:
+        center = wire.Center()
+    except Exception:
+        center = face.Center()
 
-    # 5️⃣ Construct precise plane in face orientation
     plane = cq.Plane((center.x, center.y, center.z), (normal.x, normal.y, normal.z))
 
     try:
         wp = cq.Workplane(plane).add(wire)
 
+        # symmetrisch door plaatdikte
         pos = wp.toPending().extrude(thickness / 2)
         neg = wp.toPending().extrude(-thickness / 2)
-
         return pos.union(neg)
 
     except Exception as e:
@@ -145,12 +148,141 @@ def build_solid_from_wire(face, wire, thickness, f_idx, w_idx):
 
 
 # =====================================================
+# Utility: Detect & fill circular through-holes
+# (werkt ook op flenzen / schuine vlakken)
+# =====================================================
+
+def detect_circular_hole_fills(shape):
+    """
+    Detect analytic circular edges that form through-holes
+    and return cq.Solid cylinders that fill these holes.
+    """
+    circles = []
+
+    # 1️⃣ Verzamel alle volledige cirkel-edges
+    for face in shape.Faces():
+        for edge in face.Edges():
+            if edge.geomType() != "CIRCLE":
+                continue
+            try:
+                ga = edge._geomAdaptor()
+                circ = ga.Circle()
+                center = circ.Location()   # gp_Pnt
+                axis = circ.Axis()         # gp_Ax1
+                direction = axis.Direction()
+                r = float(circ.Radius())
+                if r <= 0:
+                    continue
+
+                # Check of edge ongeveer een volledige cirkel is
+                L = float(edge.Length())
+                full_L = 2.0 * math.pi * r
+                if abs(L - full_L) > 0.02 * full_L:
+                    continue
+
+                C = cq.Vector(center.X(), center.Y(), center.Z())
+                D = cq.Vector(direction.X(), direction.Y(), direction.Z())
+                if D.Length == 0:
+                    continue
+                D = D.normalized()
+
+                circles.append({"center": C, "dir": D, "r": r})
+            except Exception as e:
+                print("⚠️ circle extraction failed:", e)
+                continue
+
+    if not circles:
+        return []
+
+    # 2️⃣ Paar cirkels tot doorlopende gaten
+    used = set()
+    fills = []
+
+    def vec_sub(a: cq.Vector, b: cq.Vector) -> cq.Vector:
+        return cq.Vector(a.x - b.x, a.y - b.y, a.z - b.z)
+
+    def vec_scale(a: cq.Vector, s: float) -> cq.Vector:
+        return cq.Vector(a.x * s, a.y * s, a.z * s)
+
+    def vec_len(a: cq.Vector) -> float:
+        return math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+
+    for i in range(len(circles)):
+        if i in used:
+            continue
+        ci = circles[i]
+        best_j = None
+        best_depth = 0.0
+
+        for j in range(len(circles)):
+            if j == i or j in used:
+                continue
+            cj = circles[j]
+
+            # Richting moet ongeveer gelijk of tegengesteld zijn
+            dot_dir = abs(ci["dir"].dot(cj["dir"]))
+            if dot_dir < 0.99:
+                continue
+
+            diff = vec_sub(cj["center"], ci["center"])
+            # component langs de as
+            proj = diff.dot(ci["dir"])
+            lateral_vec = vec_sub(diff, vec_scale(ci["dir"], proj))
+            lateral = vec_len(lateral_vec)
+
+            # Lateral verplaatsing moet klein zijn (zelfde as)
+            if lateral > ci["r"] * 0.1:
+                continue
+
+            depth = abs(proj)
+            if depth > best_depth and depth > 0.5:  # minimaal 0.5mm diepte
+                best_depth = depth
+                best_j = j
+
+        if best_j is None:
+            continue
+
+        used.add(i)
+        used.add(best_j)
+
+        ci_center = circles[i]["center"]
+        dir_vec = circles[i]["dir"]
+        r = circles[i]["r"]
+
+        # Midden van het gat bepalen
+        # Neem diff langs as
+        cj_center = circles[best_j]["center"]
+        diff = vec_sub(cj_center, ci_center)
+        proj = diff.dot(dir_vec)
+        mid = cq.Vector(
+            ci_center.x + 0.5 * proj * dir_vec.x,
+            ci_center.y + 0.5 * proj * dir_vec.y,
+            ci_center.z + 0.5 * proj * dir_vec.z,
+        )
+
+        # 3️⃣ Cylinder extruderen rondom dit midden
+        try:
+            plane = cq.Plane((mid.x, mid.y, mid.z), (dir_vec.x, dir_vec.y, dir_vec.z))
+            wp = cq.Workplane(plane).circle(r)
+            pos = wp.extrude(best_depth / 2)
+            neg = wp.extrude(-best_depth / 2)
+            solid = pos.union(neg)
+            fills.append(solid)
+        except Exception as e:
+            print("⚠️ circular fill creation failed:", e)
+            continue
+
+    print(f"🟢 Circular fills created: {len(fills)}")
+    return fills
+
+
+# =====================================================
 # API Root
 # =====================================================
 
 @app.get("/")
 def root():
-    return {"status": "HangLogic v2.3.1 running"}
+    return {"status": "HangLogic v3.0.0 running"}
 
 
 # =====================================================
@@ -187,31 +319,34 @@ async def analyze_step(file: UploadFile = File(...)):
         }
         thickness = dims["z"]
 
-        # Detect holes/inner contours
+        # -----------------------------------------
+        # 1️⃣ Niet-ronde binnencontouren via wires
+        # -----------------------------------------
         inner_data = detect_inner_wires(shape)
-
         filled_solids = []
 
-        # Build solids for each inner contour
         for f_idx, face, wires in inner_data:
             for w_idx, wire in enumerate(wires):
-
-                # Hard validation
                 if wire.isNull() or wire.Length() < 0.1:
                     print(f"⚠️ Skipping null/tiny wire {w_idx}")
                     continue
 
                 solid = build_solid_from_wire(face, wire, thickness, f_idx, w_idx)
-
                 if solid:
                     filled_solids.append(solid)
+
+        # -----------------------------------------
+        # 2️⃣ Ronde gaten via circle-detectie
+        # -----------------------------------------
+        circular_fills = detect_circular_hole_fills(shape)
+        filled_solids.extend(circular_fills)
 
         # =====================================================
         # Build GLB Assembly
         # =====================================================
 
-        base_color = Color(0.6, 0.8, 1.0)
-        fill_color = Color(0.0, 1.0, 0.0)
+        base_color = Color(0.6, 0.8, 1.0)   # lichtblauw
+        fill_color = Color(0.0, 1.0, 0.0)   # groen
 
         asm = cq.Assembly()
         asm.add(shape, name="base", color=base_color)
@@ -231,18 +366,19 @@ async def analyze_step(file: UploadFile = File(...)):
         glb_url = upload_new_file(tmp_glb, file.filename.replace(".step", ".glb"))
 
         # Save DB entry
-        supabase.table("analyzed_parts").insert({
-            "filename": file.filename,
-            "dimensions": dims,
-            "bounding_box_x": dims["x"],
-            "bounding_box_y": dims["y"],
-            "bounding_box_z": dims["z"],
-            "holes_detected": len(inner_data),
-            "units": "mm",
-            "model_url": stl_url,
-            "model_url_glb": glb_url,
-            "created_at": "now()"
-        }).execute()
+        if supabase:
+            supabase.table("analyzed_parts").insert({
+                "filename": file.filename,
+                "dimensions": dims,
+                "bounding_box_x": dims["x"],
+                "bounding_box_y": dims["y"],
+                "bounding_box_z": dims["z"],
+                "holes_detected": len(filled_solids),
+                "units": "mm",
+                "model_url": stl_url,
+                "model_url_glb": glb_url,
+                "created_at": "now()"
+            }).execute()
 
         return {
             "status": "success",
@@ -264,5 +400,5 @@ async def analyze_step(file: UploadFile = File(...)):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
-            except:
+            except Exception:
                 pass
