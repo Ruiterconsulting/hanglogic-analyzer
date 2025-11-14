@@ -19,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.7.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +86,7 @@ def ensure_step(filename: str):
 def make_bbox_dims(bbox) -> dict:
     """
     Sorteer de drie afmetingen: grootste = X, middelste = Y, kleinste = Z.
+    (Voor display; níet meer als dikte gebruiken.)
     """
     raw = [float(bbox.xlen), float(bbox.ylen), float(bbox.zlen)]
     sorted_dims = sorted(raw, reverse=True)
@@ -118,6 +119,7 @@ def safe_error_payload(filename: str | None, message: str, trace: str):
 def point_inside_solid(shape, pt: cq.Vector, tol: float = 1e-5) -> bool:
     """
     Check of een punt binnen of op de solid ligt via BRepClass3d_SolidClassifier.
+    (Nu vooral reserve, wordt niet meer actief gebruikt in de logic.)
     """
     try:
         classifier = BRepClass3d_SolidClassifier(shape.wrapped)
@@ -204,14 +206,61 @@ def detect_inner_wires(shape):
     return result
 
 
-def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
+def compute_local_thickness(shape, face, global_min_dim: float) -> float:
+    """
+    Bepaal de lokale plaatdikte bij deze face:
+
+    - normal n1 via cq.Workplane(face).plane.zDir (naar buiten)
+    - zoek andere faces met normal ~ tegengesteld
+    - neem de kleinste positieve projectieafstand langs n1
+
+    Valt terug op global_min_dim als er niets gevonden wordt.
+    """
+    try:
+        wp1 = cq.Workplane(face)
+        n1 = wp1.plane.zDir.normalized()
+        c1 = face.Center()
+    except Exception as e:
+        print("⚠️ compute_local_thickness: plane/center failed:", e)
+        return max(global_min_dim, 1.0)
+
+    best = None
+    for other in shape.Faces():
+        if other is face:
+            continue
+        try:
+            wp2 = cq.Workplane(other)
+            n2 = wp2.plane.zDir.normalized()
+        except Exception:
+            continue
+
+        # normals bijna tegengesteld?
+        dot = n1.dot(n2)
+        if abs(dot + 1.0) > 0.05:
+            continue
+
+        c2 = other.Center()
+        v = cq.Vector(c2.x - c1.x, c2.y - c1.y, c2.z - c1.z)
+        th = abs(v.dot(n1))
+        if th <= 1e-3:
+            continue
+        if best is None or th < best:
+            best = th
+
+    if best is None:
+        print("⚠️ No local thickness found, using global_min_dim:", global_min_dim)
+        return max(global_min_dim, 1.0)
+
+    print(f"   ➜ Local thickness ~ {best:.3f} mm")
+    return best
+
+
+def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     """
     Bouw een groen solid die het gat opvult:
 
-    - wire repareren
-    - normal via cq.Workplane(face).plane.zDir
-    - bepaal aan welke kant het materiaal ligt (inside-check)
-    - extrude ~halve plaatdikte naar binnen
+    - wire (binnencontour) repareren
+    - extrude exact de lokale dikte naar binnen (tegenover de face-normal)
     """
     wire = repair_wire(wire)
 
@@ -222,43 +271,18 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
     except Exception:
         return None
 
-    # center van het gat op deze face
     try:
-        c = wire.Center()
-    except Exception:
-        c = face.Center()
-
-    # face-normal via CadQuery workplane
-    try:
-        wp_temp = cq.Workplane(face)
-        n = wp_temp.plane.zDir.normalized()
+        wp = cq.Workplane(face).add(wire)
+        n = cq.Workplane(face).plane.zDir.normalized()
     except Exception as e:
-        print(f"⚠️ getting plane/normal failed on face {f_idx}: {e}")
+        print(f"⚠️ build_fill_from_wire: workplane/normal failed on face {f_idx}: {e}")
         return None
 
-    # bepaal welke kant "binnen" is
-    eps = max(thickness * 0.1, 0.2)
-    p_minus = cq.Vector(c.x - n.x * eps, c.y - n.y * eps, c.z - n.z * eps)
-    p_plus = cq.Vector(c.x + n.x * eps, c.y + n.y * eps, c.z + n.z * eps)
-
-    inside_minus = point_inside_solid(shape, p_minus)
-    inside_plus = point_inside_solid(shape, p_plus)
-
-    if inside_minus and not inside_plus:
-        direction = -1.0
-    elif inside_plus and not inside_minus:
-        direction = 1.0
-    elif inside_minus and inside_plus:
-        print(f"⚠️ Both directions inside for face {f_idx}, wire {w_idx}, defaulting to -1")
-        direction = -1.0
-    else:
-        print(f"⚠️ No inside direction found for face {f_idx}, wire {w_idx}, defaulting to -1")
-        direction = -1.0
+    # naar binnen = tegen de face-normal in
+    direction = -1.0
 
     try:
-        # workplane op de face, wire erin, en naar binnen extruden
-        wp = cq.Workplane(face).add(wire)
-        depth = max(thickness * 0.5, 0.5) * 1.05  # ~halve dikte naar binnen
+        depth = max(thickness, 0.5) * 1.02  # ietsje langer dan de dikte
         solid = wp.toPending().extrude(direction * depth)
         return solid
     except Exception as e:
@@ -272,7 +296,7 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.7.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.8.0)"}
 
 
 @app.post("/analyze")
@@ -296,16 +320,14 @@ async def analyze_step(file: UploadFile = File(...)):
         if shape is None or shape.isNull():
             raise RuntimeError("Imported STEP shape is null")
 
-        # 3️⃣ Bounding box & dikte
+        # 3️⃣ Bounding box & globale min-dikte
         bbox = shape.BoundingBox()
         dims = make_bbox_dims(bbox)
-
-        raw_thickness = min(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
-        thickness = raw_thickness if raw_thickness > 0 else 1.0
+        global_min_dim = min(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
 
         print(
             f"📏 BoundingBox raw: ({bbox.xlen}, {bbox.ylen}, {bbox.zlen}), "
-            f"sorted dims = {dims}, thickness ≈ {thickness}"
+            f"sorted dims = {dims}, global_min_dim ≈ {global_min_dim}"
         )
 
         # 4️⃣ Volume
@@ -318,9 +340,21 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_wires(shape)
         fills = []
 
+        seen_centers = set()  # per gat maar één plug
+
         for f_idx, face, wires in inner_faces:
+            local_th = compute_local_thickness(shape, face, global_min_dim)
             for w_idx, wire in enumerate(wires):
-                solid = build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx)
+                try:
+                    c = wire.Center()
+                    key = (round(c.x, 2), round(c.y, 2), round(c.z, 2))
+                    if key in seen_centers:
+                        continue
+                    seen_centers.add(key)
+                except Exception:
+                    pass
+
+                solid = build_fill_from_wire(face, wire, local_th, f_idx, w_idx)
                 if solid is not None:
                     fills.append(solid)
 
