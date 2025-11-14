@@ -19,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.8.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,7 +119,7 @@ def safe_error_payload(filename: str | None, message: str, trace: str):
 def point_inside_solid(shape, pt: cq.Vector, tol: float = 1e-5) -> bool:
     """
     Check of een punt binnen of op de solid ligt via BRepClass3d_SolidClassifier.
-    (Nu vooral reserve, wordt niet meer actief gebruikt in de logic.)
+    (Momenteel alleen als reserve gebruikt.)
     """
     try:
         classifier = BRepClass3d_SolidClassifier(shape.wrapped)
@@ -260,7 +260,9 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     Bouw een groen solid die het gat opvult:
 
     - wire (binnencontour) repareren
-    - extrude exact de lokale dikte naar binnen (tegenover de face-normal)
+    - extrude ~halve dikte naar binnen (tegenover de face-normal)
+      zodat twee tegenoverliggende faces elkaar in het midden overlappen
+      en beide oppervlakken vlak blijven.
     """
     wire = repair_wire(wire)
 
@@ -282,7 +284,8 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     direction = -1.0
 
     try:
-        depth = max(thickness, 0.5) * 1.02  # ietsje langer dan de dikte
+        # ~halve dikte, ietsje meer voor overlap, maar < totale dikte
+        depth = max(thickness * 0.55, 0.5)
         solid = wp.toPending().extrude(direction * depth)
         return solid
     except Exception as e:
@@ -296,7 +299,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.8.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.9.0)"}
 
 
 @app.post("/analyze")
@@ -340,20 +343,11 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_wires(shape)
         fills = []
 
-        seen_centers = set()  # per gat maar één plug
-
+        # 👉 GEEN dedupe meer: tegenoverliggende faces maken
+        # ieder een halve plug, die in het midden overlappen.
         for f_idx, face, wires in inner_faces:
             local_th = compute_local_thickness(shape, face, global_min_dim)
             for w_idx, wire in enumerate(wires):
-                try:
-                    c = wire.Center()
-                    key = (round(c.x, 2), round(c.y, 2), round(c.z, 2))
-                    if key in seen_centers:
-                        continue
-                    seen_centers.add(key)
-                except Exception:
-                    pass
-
                 solid = build_fill_from_wire(face, wire, local_th, f_idx, w_idx)
                 if solid is not None:
                     fills.append(solid)
