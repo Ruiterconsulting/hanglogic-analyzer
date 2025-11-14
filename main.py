@@ -19,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="5.1.0")
+app = FastAPI(title="HangLogic Analyzer API", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,11 +146,14 @@ def repair_wire(wire):
 
 def detect_inner_wires(shape):
     """
-    Zoek ALLE gesloten binnencontouren op faces:
+    Eenvoudige & robuuste detectie van binnencontouren:
 
-    - gebruik face.innerWires() als CadQuery dat ondersteunt
-    - gebruik face.outerWire() om buitencontour expliciet uit te sluiten
-    - fallback: grootste wire = outer, rest = inner
+    - Voor elke face: neem face.Wires()
+    - Als er meer dan 1 wire is:
+        -> neem wire[1:] als binnencontouren
+           (CadQuery exporteert meestal de buitenste wire eerst)
+    - Geen area-magie meer; volume-safeguard in de plug-bouw
+      voorkomt dat we per ongeluk het hele part vullen.
 
     Retourneert: lijst van (face_index, face, [inner_wires])
     """
@@ -159,68 +162,27 @@ def detect_inner_wires(shape):
 
     for f_idx, face in enumerate(shape.Faces()):
         faces_checked += 1
+        wires = list(face.Wires())
 
-        inners = []
+        if len(wires) <= 1:
+            continue
 
-        # 1️⃣ probeer de “officiële” innerWires + outerWire
-        try:
-            outer = face.outerWire() if hasattr(face, "outerWire") else None
-            if hasattr(face, "innerWires"):
-                raw_inners = list(face.innerWires())
-                # expliciet beschermen tegen outer die in innerWires belandt
-                for w in raw_inners:
-                    if outer is not None:
-                        try:
-                            if w.wrapped.IsSame(outer.wrapped):
-                                continue
-                        except Exception:
-                            pass
-                    inners.append(w)
-        except Exception as e:
-            print(f"⚠️ face.innerWires()/outerWire() failed on face {f_idx}: {e}")
-            inners = []
-
-        # 2️⃣ fallback als er geen inners gevonden zijn
-        if not inners:
-            wires = list(face.Wires())
-            if len(wires) <= 1:
-                continue
-
-            areas = []
-            for w in wires:
-                try:
-                    fw = cq.Face.makeFromWires(w)
-                    areas.append(abs(float(fw.Area())))
-                except Exception:
-                    areas.append(0.0)
-
-            if not areas:
-                continue
-
-            # grootste area is vrijwel zeker de buitencontour
-            outer_idx = max(range(len(areas)), key=lambda i: areas[i])
-            outer_area = areas[outer_idx]
-
-            for i, w in enumerate(wires):
-                if i == outer_idx:
+        # eerste wire = outer, rest = inner
+        inner = []
+        for w in wires[1:]:
+            try:
+                if w.isNull():
                     continue
-                try:
-                    if w.isNull():
-                        continue
-                    if hasattr(w, "isClosed") and not w.isClosed():
-                        continue
-                    if len(w.Edges()) == 0:
-                        continue
-
-                    # extra safeguard: draad met bijna dezelfde area als outer overslaan
-                    if 0.95 * outer_area <= areas[i] <= 1.05 * outer_area:
-                        continue
-                except Exception:
+                if hasattr(w, "isClosed") and not w.isClosed():
                     continue
-                inners.append(w)
+                if len(w.Edges()) == 0:
+                    continue
+            except Exception:
+                continue
+            inner.append(w)
 
-        if inners:
-            result.append((f_idx, face, inners))
+        if inner:
+            result.append((f_idx, face, inner))
 
     print(f"🔍 Faces checked: {faces_checked}, faces with inner wires: {len(result)}")
     return result
@@ -294,7 +256,7 @@ def build_fill_from_wire(face, wire, shape, max_depth, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v5.1.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v5.2.0)"}
 
 
 @app.post("/analyze")
