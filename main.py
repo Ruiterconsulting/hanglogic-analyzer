@@ -19,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.9.0")
+app = FastAPI(title="HangLogic Analyzer API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -206,63 +206,15 @@ def detect_inner_wires(shape):
     return result
 
 
-def compute_local_thickness(shape, face, global_min_dim: float) -> float:
-    """
-    Bepaal de lokale plaatdikte bij deze face:
-
-    - normal n1 via cq.Workplane(face).plane.zDir (naar buiten)
-    - zoek andere faces met normal ~ tegengesteld
-    - neem de kleinste positieve projectieafstand langs n1
-
-    Valt terug op global_min_dim als er niets gevonden wordt.
-    """
-    try:
-        wp1 = cq.Workplane(face)
-        n1 = wp1.plane.zDir.normalized()
-        c1 = face.Center()
-    except Exception as e:
-        print("⚠️ compute_local_thickness: plane/center failed:", e)
-        return max(global_min_dim, 1.0)
-
-    best = None
-    for other in shape.Faces():
-        if other is face:
-            continue
-        try:
-            wp2 = cq.Workplane(other)
-            n2 = wp2.plane.zDir.normalized()
-        except Exception:
-            continue
-
-        # normals bijna tegengesteld?
-        dot = n1.dot(n2)
-        if abs(dot + 1.0) > 0.05:
-            continue
-
-        c2 = other.Center()
-        v = cq.Vector(c2.x - c1.x, c2.y - c1.y, c2.z - c1.z)
-        th = abs(v.dot(n1))
-        if th <= 1e-3:
-            continue
-        if best is None or th < best:
-            best = th
-
-    if best is None:
-        print("⚠️ No local thickness found, using global_min_dim:", global_min_dim)
-        return max(global_min_dim, 1.0)
-
-    print(f"   ➜ Local thickness ~ {best:.3f} mm")
-    return best
-
-
-def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
+def build_fill_from_wire(face, wire, shape, max_depth, f_idx, w_idx):
     """
     Bouw een groen solid die het gat opvult:
 
     - wire (binnencontour) repareren
-    - extrude ~halve dikte naar binnen (tegenover de face-normal)
-      zodat twee tegenoverliggende faces elkaar in het midden overlappen
-      en beide oppervlakken vlak blijven.
+    - extrude een lange plug naar binnen (tegenover de face-normal)
+    - intersect die plug met de originele solid:
+      --> exact het volume binnen het materiaal blijft over,
+          vlak met beide oppervlakken.
     """
     wire = repair_wire(wire)
 
@@ -274,7 +226,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
         return None
 
     try:
-        wp = cq.Workplane(face).add(wire)
+        wp_face = cq.Workplane(face).add(wire)
         n = cq.Workplane(face).plane.zDir.normalized()
     except Exception as e:
         print(f"⚠️ build_fill_from_wire: workplane/normal failed on face {f_idx}: {e}")
@@ -284,12 +236,16 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     direction = -1.0
 
     try:
-        # ~halve dikte, ietsje meer voor overlap, maar < totale dikte
-        depth = max(thickness * 0.55, 0.5)
-        solid = wp.toPending().extrude(direction * depth)
-        return solid
+        depth = max_depth * 2.0  # ruim genoeg om het hele onderdeel te doorsteken
+        long_wp = wp_face.toPending().extrude(direction * depth)  # Workplane
+        shape_wp = cq.Workplane("XY").newObject([shape])
+
+        # intersect → plug precies binnen de solid
+        plug_wp = long_wp.intersect(shape_wp)
+        plug = plug_wp.val()
+        return plug
     except Exception as e:
-        print(f"⚠️ Fill extrude failed on face {f_idx}, wire {w_idx}: {e}")
+        print(f"⚠️ Fill extrude/intersect failed on face {f_idx}, wire {w_idx}: {e}")
         return None
 
 
@@ -299,7 +255,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.9.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v5.0.0)"}
 
 
 @app.post("/analyze")
@@ -323,14 +279,13 @@ async def analyze_step(file: UploadFile = File(...)):
         if shape is None or shape.isNull():
             raise RuntimeError("Imported STEP shape is null")
 
-        # 3️⃣ Bounding box & globale min-dikte
+        # 3️⃣ Bounding box
         bbox = shape.BoundingBox()
         dims = make_bbox_dims(bbox)
-        global_min_dim = min(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
-
+        max_dim = max(float(bbox.xlen), float(bbox.ylen), float(bbox.zlen))
         print(
             f"📏 BoundingBox raw: ({bbox.xlen}, {bbox.ylen}, {bbox.zlen}), "
-            f"sorted dims = {dims}, global_min_dim ≈ {global_min_dim}"
+            f"sorted dims = {dims}, max_dim ≈ {max_dim}"
         )
 
         # 4️⃣ Volume
@@ -343,12 +298,21 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_wires(shape)
         fills = []
 
-        # 👉 GEEN dedupe meer: tegenoverliggende faces maken
-        # ieder een halve plug, die in het midden overlappen.
+        # dedupe op center zodat we niet 2× exact dezelfde plug
+        seen_centers = set()
+
         for f_idx, face, wires in inner_faces:
-            local_th = compute_local_thickness(shape, face, global_min_dim)
             for w_idx, wire in enumerate(wires):
-                solid = build_fill_from_wire(face, wire, local_th, f_idx, w_idx)
+                try:
+                    c = wire.Center()
+                    key = (round(c.x, 2), round(c.y, 2), round(c.z, 2))
+                    if key in seen_centers:
+                        continue
+                    seen_centers.add(key)
+                except Exception:
+                    pass
+
+                solid = build_fill_from_wire(face, wire, shape, max_dim, f_idx, w_idx)
                 if solid is not None:
                     fills.append(solid)
 
