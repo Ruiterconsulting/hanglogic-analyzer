@@ -10,7 +10,6 @@ import os
 import traceback
 
 from supabase import create_client, Client
-from OCP.ShapeFix import ShapeFix_Wire
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.gp import gp_Pnt
 from OCP.TopAbs import TopAbs_IN, TopAbs_ON
@@ -20,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.6.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +98,7 @@ def make_bbox_dims(bbox) -> dict:
 
 def safe_error_payload(filename: str | None, message: str, trace: str):
     """
-    Zodat je in Postman / Lovable ALTIJD nette JSON terugkrijgt.
+    Net JSON foutobject voor Postman / Lovable.
     """
     return {
         "status": "error",
@@ -137,22 +136,9 @@ def point_inside_solid(shape, pt: cq.Vector, tol: float = 1e-5) -> bool:
 
 def repair_wire(wire):
     """
-    Fix rommelige STEP-wires met ShapeFix_Wire.
+    Voor nu: geen ShapeFix, de STEP-wires zijn al bruikbaar.
+    Laat dit als passthrough om later eventueel nog te tunen.
     """
-    try:
-        fixer = ShapeFix_Wire(wire.wrapped)
-        fixer.ClosedWireMode()
-        fixer.FixReorder()
-        fixer.FixConnected()
-        fixer.FixSelfIntersection()
-        fixer.SetPrecision(1e-6)
-        fixed_wrapped = fixer.Wire()
-        fixed = cq.Wire(fixed_wrapped)
-        if fixed and (not fixed.isNull()):
-            return fixed
-    except Exception as e:
-        print("⚠️ ShapeFix_Wire failed:", e)
-
     return wire
 
 
@@ -223,9 +209,9 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
     Bouw een groen solid die het gat opvult:
 
     - wire repareren
-    - bepaal face-normal via face.toPln()
-    - kijk aan welke kant van de face het materiaal ligt (inside check)
-    - extrude ongeveer een halve plaatdikte naar binnen
+    - normal via cq.Workplane(face).plane.zDir
+    - bepaal aan welke kant het materiaal ligt (inside-check)
+    - extrude ~halve plaatdikte naar binnen
     """
     wire = repair_wire(wire)
 
@@ -242,12 +228,12 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
     except Exception:
         c = face.Center()
 
-    # face-normal via plane
+    # face-normal via CadQuery workplane
     try:
-        plane = face.toPln()
-        n = plane.zDir.normalized()
+        wp_temp = cq.Workplane(face)
+        n = wp_temp.plane.zDir.normalized()
     except Exception as e:
-        print(f"⚠️ face.toPln failed on face {f_idx}: {e}")
+        print(f"⚠️ getting plane/normal failed on face {f_idx}: {e}")
         return None
 
     # bepaal welke kant "binnen" is
@@ -263,15 +249,14 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
     elif inside_plus and not inside_minus:
         direction = 1.0
     elif inside_minus and inside_plus:
-        # beide kanten "binnen" → kies willekeurig maar log het
         print(f"⚠️ Both directions inside for face {f_idx}, wire {w_idx}, defaulting to -1")
         direction = -1.0
     else:
-        # geen van beide is binnen → fallback
         print(f"⚠️ No inside direction found for face {f_idx}, wire {w_idx}, defaulting to -1")
         direction = -1.0
 
     try:
+        # workplane op de face, wire erin, en naar binnen extruden
         wp = cq.Workplane(face).add(wire)
         depth = max(thickness * 0.5, 0.5) * 1.05  # ~halve dikte naar binnen
         solid = wp.toPending().extrude(direction * depth)
@@ -287,7 +272,7 @@ def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.6.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.7.0)"}
 
 
 @app.post("/analyze")
