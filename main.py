@@ -11,13 +11,16 @@ import traceback
 
 from supabase import create_client, Client
 from OCP.ShapeFix import ShapeFix_Wire
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.gp import gp_Pnt
+from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 
 
 # =====================================================
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="4.5.0")
+app = FastAPI(title="HangLogic Analyzer API", version="4.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -113,6 +116,21 @@ def safe_error_payload(filename: str | None, message: str, trace: str):
     }
 
 
+def point_inside_solid(shape, pt: cq.Vector, tol: float = 1e-5) -> bool:
+    """
+    Check of een punt binnen of op de solid ligt via BRepClass3d_SolidClassifier.
+    """
+    try:
+        classifier = BRepClass3d_SolidClassifier(shape.wrapped)
+        p = gp_Pnt(float(pt.x), float(pt.y), float(pt.z))
+        classifier.Perform(p, tol)
+        state = classifier.State()
+        return state in (TopAbs_IN, TopAbs_ON)
+    except Exception as e:
+        print("⚠️ point_inside_solid failed:", e)
+        return False
+
+
 # =====================================================
 # Geometry helpers
 # =====================================================
@@ -200,13 +218,14 @@ def detect_inner_wires(shape):
     return result
 
 
-def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
+def build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx):
     """
     Bouw een groen solid die het gat opvult:
 
     - wire repareren
-    - Workplane op de face (CadQuery regelt zelf de oriëntatie)
-    - extrude één kant op (naar binnen) over ongeveer de plaatdikte
+    - bepaal face-normal via face.toPln()
+    - kijk aan welke kant van de face het materiaal ligt (inside check)
+    - extrude ongeveer een halve plaatdikte naar binnen
     """
     wire = repair_wire(wire)
 
@@ -217,12 +236,45 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
     except Exception:
         return None
 
+    # center van het gat op deze face
+    try:
+        c = wire.Center()
+    except Exception:
+        c = face.Center()
+
+    # face-normal via plane
+    try:
+        plane = face.toPln()
+        n = plane.zDir.normalized()
+    except Exception as e:
+        print(f"⚠️ face.toPln failed on face {f_idx}: {e}")
+        return None
+
+    # bepaal welke kant "binnen" is
+    eps = max(thickness * 0.1, 0.2)
+    p_minus = cq.Vector(c.x - n.x * eps, c.y - n.y * eps, c.z - n.z * eps)
+    p_plus = cq.Vector(c.x + n.x * eps, c.y + n.y * eps, c.z + n.z * eps)
+
+    inside_minus = point_inside_solid(shape, p_minus)
+    inside_plus = point_inside_solid(shape, p_plus)
+
+    if inside_minus and not inside_plus:
+        direction = -1.0
+    elif inside_plus and not inside_minus:
+        direction = 1.0
+    elif inside_minus and inside_plus:
+        # beide kanten "binnen" → kies willekeurig maar log het
+        print(f"⚠️ Both directions inside for face {f_idx}, wire {w_idx}, defaulting to -1")
+        direction = -1.0
+    else:
+        # geen van beide is binnen → fallback
+        print(f"⚠️ No inside direction found for face {f_idx}, wire {w_idx}, defaulting to -1")
+        direction = -1.0
+
     try:
         wp = cq.Workplane(face).add(wire)
-        # ietsje langer dan de dikte zodat hij zeker door de plaat heen gaat
-        depth = max(thickness, 1.0) * 1.05
-        # negatieve extrude = naar binnen t.o.v. de face-normal
-        solid = wp.toPending().extrude(-depth)
+        depth = max(thickness * 0.5, 0.5) * 1.05  # ~halve dikte naar binnen
+        solid = wp.toPending().extrude(direction * depth)
         return solid
     except Exception as e:
         print(f"⚠️ Fill extrude failed on face {f_idx}, wire {w_idx}: {e}")
@@ -235,7 +287,7 @@ def build_fill_from_wire(face, wire, thickness, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v4.5.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v4.6.0)"}
 
 
 @app.post("/analyze")
@@ -281,23 +333,9 @@ async def analyze_step(file: UploadFile = File(...)):
         inner_faces = detect_inner_wires(shape)
         fills = []
 
-        # dedupe: per gat maar één fill (op basis van wire center)
-        seen_centers = set()
-
         for f_idx, face, wires in inner_faces:
             for w_idx, wire in enumerate(wires):
-                try:
-                    c = wire.Center()
-                except Exception:
-                    c = face.Center()
-
-                key = (round(c.x, 2), round(c.y, 2), round(c.z, 2))
-                if key in seen_centers:
-                    # dit gat hebben we al gevuld vanaf de andere zijde
-                    continue
-                seen_centers.add(key)
-
-                solid = build_fill_from_wire(face, wire, thickness, f_idx, w_idx)
+                solid = build_fill_from_wire(shape, face, wire, thickness, f_idx, w_idx)
                 if solid is not None:
                     fills.append(solid)
 
