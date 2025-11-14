@@ -19,7 +19,7 @@ from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 # FastAPI setup
 # =====================================================
 
-app = FastAPI(title="HangLogic Analyzer API", version="5.0.0")
+app = FastAPI(title="HangLogic Analyzer API", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,6 +149,7 @@ def detect_inner_wires(shape):
     Zoek ALLE gesloten binnencontouren op faces:
 
     - gebruik face.innerWires() als CadQuery dat ondersteunt
+    - gebruik face.outerWire() om buitencontour expliciet uit te sluiten
     - fallback: grootste wire = outer, rest = inner
 
     Retourneert: lijst van (face_index, face, [inner_wires])
@@ -160,15 +161,27 @@ def detect_inner_wires(shape):
         faces_checked += 1
 
         inners = []
+
+        # 1️⃣ probeer de “officiële” innerWires + outerWire
         try:
+            outer = face.outerWire() if hasattr(face, "outerWire") else None
             if hasattr(face, "innerWires"):
-                inners = list(face.innerWires())
+                raw_inners = list(face.innerWires())
+                # expliciet beschermen tegen outer die in innerWires belandt
+                for w in raw_inners:
+                    if outer is not None:
+                        try:
+                            if w.wrapped.IsSame(outer.wrapped):
+                                continue
+                        except Exception:
+                            pass
+                    inners.append(w)
         except Exception as e:
-            print(f"⚠️ face.innerWires() failed on face {f_idx}: {e}")
+            print(f"⚠️ face.innerWires()/outerWire() failed on face {f_idx}: {e}")
             inners = []
 
+        # 2️⃣ fallback als er geen inners gevonden zijn
         if not inners:
-            # fallback
             wires = list(face.Wires())
             if len(wires) <= 1:
                 continue
@@ -184,7 +197,10 @@ def detect_inner_wires(shape):
             if not areas:
                 continue
 
+            # grootste area is vrijwel zeker de buitencontour
             outer_idx = max(range(len(areas)), key=lambda i: areas[i])
+            outer_area = areas[outer_idx]
+
             for i, w in enumerate(wires):
                 if i == outer_idx:
                     continue
@@ -194,6 +210,10 @@ def detect_inner_wires(shape):
                     if hasattr(w, "isClosed") and not w.isClosed():
                         continue
                     if len(w.Edges()) == 0:
+                        continue
+
+                    # extra safeguard: draad met bijna dezelfde area als outer overslaan
+                    if 0.95 * outer_area <= areas[i] <= 1.05 * outer_area:
                         continue
                 except Exception:
                     continue
@@ -238,11 +258,30 @@ def build_fill_from_wire(face, wire, shape, max_depth, f_idx, w_idx):
     try:
         depth = max_depth * 2.0  # ruim genoeg om het hele onderdeel te doorsteken
         long_wp = wp_face.toPending().extrude(direction * depth)  # Workplane
-        shape_wp = cq.Workplane("XY").newObject([shape])
 
-        # intersect → plug precies binnen de solid
-        plug_wp = long_wp.intersect(shape_wp)
+        # expliciet met solids werken voor intersect
+        long_solid = long_wp.val()
+        wp_long = cq.Workplane("XY").newObject([long_solid])
+        wp_shape = cq.Workplane("XY").newObject([shape])
+
+        plug_wp = wp_long.intersect(wp_shape)
         plug = plug_wp.val()
+
+        # ✅ safeguard: als plug bijna even groot is als het hele part → fout, overslaan
+        try:
+            part_vol = float(shape.Volume())
+            plug_vol = float(plug.Volume())
+            if part_vol > 0 and plug_vol > 0:
+                ratio = plug_vol / part_vol
+                if ratio > 0.8:
+                    print(
+                        f"⚠️ Plug volume ~{ratio:.2f} van part volume "
+                        f"(face {f_idx}, wire {w_idx}), skipping (waarschijnlijk outer wire)."
+                    )
+                    return None
+        except Exception as e:
+            print("⚠️ Volume check failed:", e)
+
         return plug
     except Exception as e:
         print(f"⚠️ Fill extrude/intersect failed on face {f_idx}, wire {w_idx}: {e}")
@@ -255,7 +294,7 @@ def build_fill_from_wire(face, wire, shape, max_depth, f_idx, w_idx):
 
 @app.get("/")
 def root():
-    return {"message": "HangLogic analyzer live ✅ (v5.0.0)"}
+    return {"message": "HangLogic analyzer live ✅ (v5.1.0)"}
 
 
 @app.post("/analyze")
